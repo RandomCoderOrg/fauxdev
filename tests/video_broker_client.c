@@ -4,6 +4,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <pthread.h>
