@@ -29,6 +29,9 @@ struct fauxdev_transport;
 
 FAUXDEV_INTERNAL struct fauxdev_transport *
 fauxdev_transport_connect(const char *socket_path, int readiness_fd);
+/* Borrows connected_fd; the transport duplicates it and owns only the duplicate. */
+FAUXDEV_INTERNAL struct fauxdev_transport *
+fauxdev_transport_from_fd(int connected_fd, int readiness_fd);
 FAUXDEV_INTERNAL int fauxdev_transport_request(
     struct fauxdev_transport *transport,
     uint16_t opcode,

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -88,8 +89,23 @@ static int video_open(int readiness_fd, int flags, void **data) {
     if (error) { pthread_mutex_destroy(&s->lifecycle_lock); pthread_mutex_destroy(&s->lock); syscall(SYS_close, s->readiness_fd); free(s); errno = error; return -1; }
     s->pixels = malloc(FRAME_SIZE);
     if (!s->pixels) goto fail;
+    const char *inherited_fd = getenv("FAUXDEV_VIDEO_FD");
     const char *socket_path = getenv("FAUXDEV_VIDEO_SOCKET");
-    if (socket_path && *socket_path) {
+    if (inherited_fd && *inherited_fd) {
+        char *end = NULL;
+        errno = 0;
+        long fd = strtol(inherited_fd, &end, 10);
+        if (errno || end == inherited_fd || *end || fd < 0 || fd > INT_MAX) {
+            errno = EINVAL;
+            goto fail;
+        }
+        s->broker = fauxdev_transport_from_fd((int)fd, readiness_fd);
+        int saved_errno = errno;
+        syscall(SYS_close, (int)fd);
+        errno = saved_errno;
+        if (!s->broker) goto fail;
+        // shortcut: one inherited broker connection supports one video open per process.
+    } else if (socket_path && *socket_path) {
         s->socket_path = strdup(socket_path);
         if (!s->socket_path) goto fail;
         s->broker = fauxdev_transport_connect(socket_path, readiness_fd);

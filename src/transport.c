@@ -238,18 +238,20 @@ int fauxdev_transport_request(
 
     int result = fauxdev_message_send(transport->socket_fd, &request);
     if (result == 0) {
-        const struct timeval timeout = {
-            .tv_sec = opcode == FAUXDEV_OPCODE_VIDEO_FRAME ? 20 : 2,
-        };
-        result = setsockopt(transport->socket_fd, SOL_SOCKET, SO_RCVTIMEO,
-                            &timeout, sizeof(timeout));
+        /* Android may forbid changing options on a socket passed from another app. */
+        struct pollfd ready = {.fd = transport->socket_fd, .events = POLLIN};
+        do {
+            result = poll(&ready, 1, opcode == FAUXDEV_OPCODE_VIDEO_FRAME ? 20000 : 2000);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0) { errno = ETIMEDOUT; result = -1; }
+        else if (result > 0) result = 0;
     }
     if (result == 0) result = fauxdev_message_receive(transport->socket_fd, response);
     if (result < 0) {
         const int saved_errno = errno;
         mark_disconnected(transport);
         pthread_mutex_unlock(&transport->request_lock);
-        errno = saved_errno == EAGAIN || saved_errno == EWOULDBLOCK
+        errno = saved_errno == ETIMEDOUT || saved_errno == EAGAIN || saved_errno == EWOULDBLOCK
                     ? ETIMEDOUT
                     : saved_errno == EPROTO || saved_errno == EMSGSIZE ? saved_errno : EPIPE;
         return -1;
@@ -273,42 +275,23 @@ int fauxdev_transport_request(
     return 0;
 }
 
-struct fauxdev_transport *fauxdev_transport_connect(const char *socket_path, int readiness_fd) {
-    if (!socket_path || !*socket_path || readiness_fd < 0) {
+static struct fauxdev_transport *open_transport(int connected_fd, int readiness_fd) {
+    if (connected_fd < 0 || readiness_fd < 0) {
         errno = EINVAL;
         return NULL;
     }
-    const size_t path_length = strlen(socket_path);
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    if (path_length >= sizeof(address.sun_path)) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-    memcpy(address.sun_path, socket_path, path_length + 1);
-
     struct fauxdev_transport *transport = calloc(1, sizeof(*transport));
-    if (!transport) return NULL;
-    transport->socket_fd = -1;
+    if (!transport) { syscall(SYS_close, connected_fd); return NULL; }
+    transport->socket_fd = connected_fd;
     transport->readiness_fd = -1;
     transport->stop_fd = -1;
     atomic_init(&transport->disconnected, false);
     const int mutex_error = pthread_mutex_init(&transport->request_lock, NULL);
     if (mutex_error) {
+        syscall(SYS_close, connected_fd);
         free(transport);
         errno = mutex_error;
         return NULL;
-    }
-
-    transport->socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (transport->socket_fd < 0) goto fail;
-    const socklen_t address_size = offsetof(struct sockaddr_un, sun_path) + path_length + 1;
-    if (connect(transport->socket_fd, (const struct sockaddr *)&address, address_size) < 0) {
-        goto fail;
-    }
-    const struct timeval timeout = {.tv_sec = 2};
-    if (setsockopt(transport->socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0 ||
-        setsockopt(transport->socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        goto fail;
     }
     transport->readiness_fd = syscall(SYS_fcntl, readiness_fd, F_DUPFD_CLOEXEC, 0);
     if (transport->readiness_fd < 0) goto fail;
@@ -340,6 +323,49 @@ fail: {
         errno = saved_errno;
         return NULL;
     }
+}
+
+struct fauxdev_transport *fauxdev_transport_connect(const char *socket_path, int readiness_fd) {
+    if (!socket_path || !*socket_path || readiness_fd < 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    const size_t path_length = strlen(socket_path);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    if (path_length >= sizeof(address.sun_path)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(address.sun_path, socket_path, path_length + 1);
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0) return NULL;
+    const socklen_t address_size = offsetof(struct sockaddr_un, sun_path) + path_length + 1;
+    if (connect(fd, (const struct sockaddr *)&address, address_size) < 0) {
+        int saved_errno = errno;
+        syscall(SYS_close, fd);
+        errno = saved_errno;
+        return NULL;
+    }
+    return open_transport(fd, readiness_fd);
+}
+
+struct fauxdev_transport *fauxdev_transport_from_fd(int connected_fd, int readiness_fd) {
+    if (connected_fd < 0 || readiness_fd < 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    int type = 0;
+    socklen_t type_size = sizeof(type);
+    if (getsockopt(connected_fd, SOL_SOCKET, SO_TYPE, &type, &type_size) < 0) {
+        return NULL;
+    }
+    if (type_size != sizeof(type) || type != SOCK_SEQPACKET) {
+        errno = EPROTOTYPE;
+        return NULL;
+    }
+    int copy = syscall(SYS_fcntl, connected_fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) return NULL;
+    return open_transport(copy, readiness_fd);
 }
 
 bool fauxdev_transport_disconnected(const struct fauxdev_transport *transport) {

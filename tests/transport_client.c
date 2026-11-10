@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/memfd.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -104,7 +105,10 @@ static int create_listener(const char *path) {
     assert(strlen(path) < sizeof(address.sun_path));
     strcpy(address.sun_path, path);
     const socklen_t size = offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1;
-    assert(bind(listener, (const struct sockaddr *)&address, size) == 0);
+    if (bind(listener, (const struct sockaddr *)&address, size) < 0) {
+        perror("transport test socket bind");
+        abort();
+    }
     assert(chmod(path, 0600) == 0);
     assert(listen(listener, 1) == 0);
     return listener;
@@ -130,8 +134,12 @@ static void test_malformed_packet(void) {
     close(sockets[1]);
 }
 
-static void test_transport(void) {
-    char directory[] = "/tmp/fauxdev-transport-XXXXXX";
+static void test_transport(int inherited) {
+    char directory[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    int length = snprintf(directory, sizeof(directory), "%s/fauxdev-transport-XXXXXX", tmp);
+    assert(length > 0 && (size_t)length < sizeof(directory));
     assert(mkdtemp(directory));
     char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     assert(snprintf(socket_path, sizeof(socket_path), "%s/broker.sock", directory) > 0);
@@ -142,8 +150,20 @@ static void test_transport(void) {
 
     int readiness_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
     assert(readiness_fd >= 0);
-    struct fauxdev_transport *transport =
-        fauxdev_transport_connect(socket_path, readiness_fd);
+    struct fauxdev_transport *transport;
+    if (inherited) {
+        int connected = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        assert(connected >= 0);
+        struct sockaddr_un address = {.sun_family = AF_UNIX};
+        strcpy(address.sun_path, socket_path);
+        assert(connect(connected, (const struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1) == 0);
+        transport = fauxdev_transport_from_fd(connected, readiness_fd);
+        assert(fcntl(connected, F_GETFD) >= 0);
+        close(connected);
+    } else {
+        transport = fauxdev_transport_connect(socket_path, readiness_fd);
+    }
     assert(transport);
 
     struct fauxdev_message response;
@@ -236,7 +256,11 @@ static void *run_silent_broker(void *data) {
 }
 
 static void test_silent_broker_timeout(int reply_to_hello) {
-    char directory[] = "/tmp/fauxdev-timeout-XXXXXX";
+    char directory[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    int length = snprintf(directory, sizeof(directory), "%s/fauxdev-timeout-XXXXXX", tmp);
+    assert(length > 0 && (size_t)length < sizeof(directory));
     assert(mkdtemp(directory));
     char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     assert(snprintf(socket_path, sizeof(socket_path), "%s/broker.sock", directory) > 0);
@@ -276,7 +300,8 @@ static void test_silent_broker_timeout(int reply_to_hello) {
 
 int main(void) {
     test_malformed_packet();
-    test_transport();
+    test_transport(0);
+    test_transport(1);
     test_silent_broker_timeout(0);
     test_silent_broker_timeout(1);
     puts("fauxdev transport tests passed");
