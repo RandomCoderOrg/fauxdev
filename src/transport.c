@@ -241,7 +241,10 @@ int fauxdev_transport_request(
         /* Android may forbid changing options on a socket passed from another app. */
         struct pollfd ready = {.fd = transport->socket_fd, .events = POLLIN};
         do {
-            result = poll(&ready, 1, opcode == FAUXDEV_OPCODE_VIDEO_FRAME ? 20000 : 2000);
+            int timeout = opcode == FAUXDEV_OPCODE_VIDEO_FRAME ? 20000 :
+                          opcode == FAUXDEV_OPCODE_CAMERA_START ? 10000 :
+                          opcode == FAUXDEV_OPCODE_CAMERA_INPUTS ? 5000 : 2000;
+            result = poll(&ready, 1, timeout);
         } while (result < 0 && errno == EINTR);
         if (result == 0) { errno = ETIMEDOUT; result = -1; }
         else if (result > 0) result = 0;

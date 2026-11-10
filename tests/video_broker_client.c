@@ -79,6 +79,13 @@ static void *broker(void *argument) {
         assert(request.opcode == FAUXDEV_OPCODE_HELLO && request.fd_count == 0);
         reply(socket_fd, &request);
         assert(fauxdev_message_receive(socket_fd, &request) == 0);
+        assert(request.opcode == FAUXDEV_OPCODE_CAMERA_INPUTS && !request.payload_size && !request.fd_count);
+        struct fauxdev_message unsupported = {
+            .opcode = request.opcode, .flags = FAUXDEV_MESSAGE_RESPONSE,
+            .request_id = request.request_id, .status = -ENOTTY,
+        };
+        assert(fauxdev_message_send(socket_fd, &unsupported) == 0);
+        assert(fauxdev_message_receive(socket_fd, &request) == 0);
         assert(request.opcode == FAUXDEV_OPCODE_VIDEO_FRAME);
         assert(request.payload_size == sizeof(struct fauxdev_video_frame_request));
         assert(request.fd_count == 1);
@@ -117,7 +124,10 @@ static void *broker(void *argument) {
 }
 
 int main(void) {
-    char directory[] = "/tmp/fauxdev-video-broker-XXXXXX";
+    char directory[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    assert(snprintf(directory, sizeof(directory), "%s/fauxdev-video-broker-XXXXXX", tmp) > 0);
     assert(mkdtemp(directory));
     char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     assert(snprintf(path, sizeof(path), "%s/broker.sock", directory) > 0);

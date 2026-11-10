@@ -24,14 +24,29 @@ directory must already exist and be private. The broker accepts only same-UID cl
 checks the frame description and passed FD bounds, and reports camera failures
 through protocol error replies. It owns the socket until `run()` stops.
 
+The optional inventory request (protocol v1 opcode 3) takes one little-endian
+32-bit byte offset and no FDs. After the normal HELLO, the broker builds one
+read-only diagnostic snapshot per client connection and returns it in chunks:
+little-endian total length and offset, followed by up to 60 KiB of text.
+The snapshot is capped at 128 KiB, remains unchanged while that client is
+connected, and is freed on disconnect. A malformed request gets an error;
+the inventory does not change camera or V4L2 settings. Live camera availability
+callbacks are not part of this snapshot.
+
 The host app must grant `CAMERA` permission and start a camera foreground
 service from a visible activity before starting the broker. Camera use
 must stop when that service stops. Android's [camera foreground-service
 restrictions](https://developer.android.com/develop/background-work/services/fgs/restrictions-bg-start)
 apply. Starting the preview and waiting for its first twelve frames can take up to fifteen seconds; the guest
 transport's `VIDEO_FRAME` receive timeout must exceed that bound.
-Cancelling the guest stream closes its transport; the broker checks for peer
+`STREAMOFF` releases the active camera while retaining its authenticated
+connection, so the same guest descriptor can select another input and restart.
+It may wait up to 20 seconds for an in-flight `VIDEO_FRAME` request to finish.
+Closing the guest descriptor cancels the transport; the broker checks for peer
 disconnect while waiting for a frame so another client can connect promptly.
+For older protocol-v1 clients, the first valid `VIDEO_FRAME` implicitly opens
+the default camera. This compatibility path is disabled once that client sends
+`CAMERA_START` or `CAMERA_STOP`.
 
 This is a low-resolution camera proof path, not a full V4L2 camera implementation. It uses a
 nearest-neighbor downscale and approximate BT.601 full-range YUV conversion;

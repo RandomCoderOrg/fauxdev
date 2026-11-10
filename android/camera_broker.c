@@ -17,6 +17,7 @@
 #include <media/NdkImageReader.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -82,20 +83,255 @@ static int64_t monotonic_ms(void) {
     return (int64_t)time.tv_sec * 1000 + time.tv_nsec / 1000000;
 }
 
-static int choose_camera(ACameraManager *manager, char **id, int *width, int *height) {
+enum { INVENTORY_LIMIT = 128 * 1024, INVENTORY_MAX_ENTRIES = 4096 };
+
+struct inventory_report {
+    char *text;
+    size_t used;
+    int error;
+};
+
+static void inventory_append(struct inventory_report *report, const char *format, ...) {
+    if (report->error) return;
+    va_list args;
+    va_start(args, format);
+    int size = vsnprintf(report->text + report->used, INVENTORY_LIMIT - report->used,
+                         format, args);
+    va_end(args);
+    if (size < 0) report->error = -EIO;
+    else if ((size_t)size >= INVENTORY_LIMIT - report->used) report->error = -ENOSPC;
+    else report->used += (size_t)size;
+}
+
+static void inventory_entry(struct inventory_report *report, const ACameraMetadata *metadata,
+                            uint32_t tag, const char *name) {
+    ACameraMetadata_const_entry entry;
+    inventory_append(report, "  %s: ", name);
+    if (ACameraMetadata_getConstEntry(metadata, tag, &entry) != ACAMERA_OK) {
+        inventory_append(report, "unavailable\n");
+        return;
+    }
+    if (!entry.count) {
+        inventory_append(report, "empty\n");
+        return;
+    }
+    if (entry.count > INVENTORY_MAX_ENTRIES) {
+        inventory_append(report, "invalid count %u\n", entry.count);
+        return;
+    }
+    if (!entry.data.u8) {
+        inventory_append(report, "invalid metadata pointer\n");
+        return;
+    }
+    for (uint32_t i = 0; i < entry.count && !report->error; ++i) {
+        if (i) inventory_append(report, ", ");
+        switch (entry.type) {
+        case ACAMERA_TYPE_BYTE: inventory_append(report, "%u", entry.data.u8[i]); break;
+        case ACAMERA_TYPE_INT32: inventory_append(report, "%d", entry.data.i32[i]); break;
+        case ACAMERA_TYPE_INT64: inventory_append(report, "%lld", (long long)entry.data.i64[i]); break;
+        case ACAMERA_TYPE_FLOAT: inventory_append(report, "%g", entry.data.f[i]); break;
+        case ACAMERA_TYPE_DOUBLE: inventory_append(report, "%g", entry.data.d[i]); break;
+        case ACAMERA_TYPE_RATIONAL:
+            inventory_append(report, "%d/%d", entry.data.r[i].numerator,
+                             entry.data.r[i].denominator);
+            break;
+        default:
+            inventory_append(report, "unknown type %u (%u values)\n", entry.type, entry.count);
+            return;
+        }
+    }
+    inventory_append(report, "\n");
+}
+
+static void inventory_physical_ids(struct inventory_report *report, const ACameraMetadata *metadata) {
+    ACameraMetadata_const_entry entry;
+    inventory_append(report, "  physical camera IDs: ");
+    if (ACameraMetadata_getConstEntry(metadata, ACAMERA_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS,
+                                      &entry) != ACAMERA_OK) {
+        inventory_append(report, "unavailable\n");
+        return;
+    }
+    if (entry.type != ACAMERA_TYPE_BYTE || entry.count > INVENTORY_MAX_ENTRIES ||
+        (entry.count && !entry.data.u8)) {
+        inventory_append(report, "invalid metadata type\n");
+        return;
+    }
+    if (!entry.count) {
+        inventory_append(report, "none reported\n");
+        return;
+    }
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < entry.count; ++i) {
+        if (entry.data.u8[i]) continue;
+        if (start) inventory_append(report, ", ");
+        for (uint32_t j = start; j < i; ++j) {
+            unsigned char c = entry.data.u8[j];
+            inventory_append(report, "%c", c >= 32 && c <= 126 ? c : '?');
+        }
+        start = i + 1;
+    }
+    if (start != entry.count) inventory_append(report, " [unterminated ID]");
+    inventory_append(report, "\n");
+}
+
+static void inventory_yuv_streams(struct inventory_report *report, const ACameraMetadata *metadata) {
+    ACameraMetadata_const_entry entry;
+    inventory_append(report, "  YUV_420_888 output sizes: ");
+    if (ACameraMetadata_getConstEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
+                                      &entry) != ACAMERA_OK) {
+        inventory_append(report, "unavailable\n");
+        return;
+    }
+    if (entry.type != ACAMERA_TYPE_INT32 || entry.count > INVENTORY_MAX_ENTRIES ||
+        entry.count % 4 ||
+        (entry.count && !entry.data.i32)) {
+        inventory_append(report, "invalid metadata layout\n");
+        return;
+    }
+    unsigned found = 0;
+    for (uint32_t i = 0; i < entry.count; i += 4) {
+        const int32_t *item = entry.data.i32 + i;
+        if (item[0] != AIMAGE_FORMAT_YUV_420_888 ||
+            item[3] != ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) continue;
+        inventory_append(report, "%s%dx%d", found++ ? ", " : "", item[1], item[2]);
+    }
+    inventory_append(report, "%s\n", found ? "" : "none reported");
+}
+
+static void inventory_camera(struct inventory_report *report, ACameraManager *manager, const char *id) {
+    inventory_append(report, "\nCamera ");
+    if (!id) {
+        inventory_append(report, "<missing ID>\n  characteristics: unavailable\n");
+        return;
+    }
+    if (strnlen(id, 257) > 256) {
+        inventory_append(report, "<ID exceeds 256 bytes>\n  characteristics: unavailable\n");
+        return;
+    }
+    for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
+        inventory_append(report, "%c", *p >= 32 && *p <= 126 ? *p : '?');
+    inventory_append(report, "\n");
+    ACameraMetadata *metadata = NULL;
+    camera_status_t status = ACameraManager_getCameraCharacteristics(manager, id, &metadata);
+    if (status != ACAMERA_OK) {
+        inventory_append(report, "  characteristics: unavailable (status %d)\n", status);
+        return;
+    }
+    if (!metadata) {
+        inventory_append(report, "  characteristics: unavailable (null metadata)\n");
+        return;
+    }
+    inventory_entry(report, metadata, ACAMERA_LENS_FACING, "lens facing");
+    inventory_entry(report, metadata, ACAMERA_SENSOR_ORIENTATION, "sensor orientation degrees");
+    inventory_entry(report, metadata, ACAMERA_INFO_SUPPORTED_HARDWARE_LEVEL, "hardware level");
+    inventory_entry(report, metadata, ACAMERA_REQUEST_AVAILABLE_CAPABILITIES, "capability IDs");
+    inventory_physical_ids(report, metadata);
+    inventory_yuv_streams(report, metadata);
+    inventory_entry(report, metadata, ACAMERA_SCALER_AVAILABLE_MIN_FRAME_DURATIONS,
+                    "stream min frame durations (format,width,height,ns)");
+    inventory_entry(report, metadata, ACAMERA_REQUEST_AVAILABLE_REQUEST_KEYS, "request tag IDs");
+    inventory_entry(report, metadata, ACAMERA_REQUEST_AVAILABLE_RESULT_KEYS, "result tag IDs");
+    inventory_entry(report, metadata, ACAMERA_REQUEST_AVAILABLE_CHARACTERISTICS_KEYS,
+                    "characteristic tag IDs");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AE_AVAILABLE_MODES, "AE modes");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, "AE FPS ranges");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, "AE compensation range");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AE_COMPENSATION_STEP, "AE compensation step");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AF_AVAILABLE_MODES, "AF modes");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_AWB_AVAILABLE_MODES, "AWB modes");
+    inventory_entry(report, metadata, ACAMERA_FLASH_INFO_AVAILABLE, "flash available");
+    inventory_entry(report, metadata, ACAMERA_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM, "max digital zoom");
+    inventory_entry(report, metadata, ACAMERA_CONTROL_ZOOM_RATIO_RANGE, "zoom ratio range");
+    inventory_entry(report, metadata, ACAMERA_SENSOR_INFO_SENSITIVITY_RANGE, "ISO range");
+    inventory_entry(report, metadata, ACAMERA_SENSOR_INFO_EXPOSURE_TIME_RANGE, "exposure time range ns");
+    int32_t tag_count = 0;
+    const uint32_t *tags = NULL;
+    status = ACameraMetadata_getAllTags(metadata, &tag_count, &tags);
+    inventory_append(report, "  all characteristic tags: ");
+    if (status != ACAMERA_OK || tag_count < 0 || tag_count > INVENTORY_MAX_ENTRIES ||
+        (tag_count && !tags))
+        inventory_append(report, "unavailable (status %d)\n", status);
+    else {
+        for (int32_t i = 0; i < tag_count; ++i)
+            inventory_append(report, "%s0x%08x", i ? ", " : "", tags[i]);
+        inventory_append(report, "\n");
+    }
+    ACameraMetadata_free(metadata);
+}
+
+static int inventory_snapshot(char **text, size_t *size) {
+    struct inventory_report report = {.text = calloc(1, INVENTORY_LIMIT)};
+    if (!report.text) return -ENOMEM;
+    inventory_append(&report, "Camera2 inventory (read-only; values are device metadata, not V4L2 support)\n");
+    ACameraManager *manager = ACameraManager_create();
+    if (!manager) inventory_append(&report, "Camera manager unavailable\n");
+    else {
+        ACameraIdList *ids = NULL;
+        camera_status_t status = ACameraManager_getCameraIdList(manager, &ids);
+        if (status != ACAMERA_OK || !ids) {
+            inventory_append(&report, "Camera ID list unavailable (status %d)\n", status);
+        } else if (ids->numCameras < 0 || ids->numCameras > 64 ||
+                   (ids->numCameras && !ids->cameraIds)) {
+            inventory_append(&report, "Camera ID list has invalid layout\n");
+            ACameraManager_deleteCameraIdList(ids);
+        } else {
+            inventory_append(&report, "%d visible camera IDs; live availability not queried\n",
+                             ids->numCameras);
+            for (int i = 0; i < ids->numCameras && !report.error; ++i)
+                inventory_camera(&report, manager, ids->cameraIds[i]);
+            ACameraManager_deleteCameraIdList(ids);
+        }
+        ACameraManager_delete(manager);
+    }
+    if (report.error) {
+        free(report.text);
+        return report.error;
+    }
+    *text = report.text;
+    *size = report.used;
+    return 0;
+}
+
+JNIEXPORT jstring JNICALL
+Java_org_randomcoder_udroid_camera_CameraBrokerBridge_inventory(JNIEnv *env, jclass cls) {
+    (void)cls;
+    char *text = NULL;
+    size_t size = 0;
+    int status = inventory_snapshot(&text, &size);
+    (void)size;
+    const char *message = status == -ENOMEM ? "Camera inventory: out of memory" :
+                          status == -ENOSPC ? "Camera inventory exceeds the 128 KiB diagnostic limit" :
+                          status ? "Camera inventory formatting failed" : text;
+    jstring result = (*env)->NewStringUTF(env, message);
+    free(text);
+    return result;
+}
+
+static int collect_inputs(ACameraManager *manager, struct fauxdev_camera_inputs_reply *out) {
     ACameraIdList *ids = NULL;
-    if (ACameraManager_getCameraIdList(manager, &ids) != ACAMERA_OK) return -EIO;
+    if (ACameraManager_getCameraIdList(manager, &ids) != ACAMERA_OK || !ids) return -EIO;
+    if (ids->numCameras < 0 || ids->numCameras > (int)FAUXDEV_CAMERA_MAX_INPUTS ||
+        (ids->numCameras && !ids->cameraIds)) {
+        ACameraManager_deleteCameraIdList(ids);
+        return -EIO;
+    }
     int best_score = INT_MIN;
     for (int i = 0; i < ids->numCameras; i++) {
+        const char *id = ids->cameraIds[i];
+        if (!id || strnlen(id, FAUXDEV_CAMERA_ID_SIZE) == FAUXDEV_CAMERA_ID_SIZE) continue;
         ACameraMetadata *metadata = NULL;
-        if (ACameraManager_getCameraCharacteristics(manager, ids->cameraIds[i], &metadata) != ACAMERA_OK)
+        if (ACameraManager_getCameraCharacteristics(manager, id, &metadata) != ACAMERA_OK || !metadata)
             continue;
         ACameraMetadata_const_entry facing;
-        const int back = ACameraMetadata_getConstEntry(metadata, ACAMERA_LENS_FACING, &facing) == ACAMERA_OK &&
-                         facing.count && facing.data.u8[0] == ACAMERA_LENS_FACING_BACK;
+        const int has_facing = ACameraMetadata_getConstEntry(metadata, ACAMERA_LENS_FACING, &facing) == ACAMERA_OK &&
+                               facing.type == ACAMERA_TYPE_BYTE && facing.count && facing.data.u8;
+        const uint32_t direction = has_facing ? facing.data.u8[0] : UINT32_MAX;
+        const int back = direction == ACAMERA_LENS_FACING_BACK;
         ACameraMetadata_const_entry configs;
         if (ACameraMetadata_getConstEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
-                                          &configs) == ACAMERA_OK) {
+                                          &configs) == ACAMERA_OK && configs.type == ACAMERA_TYPE_INT32 &&
+            configs.count <= INVENTORY_MAX_ENTRIES && configs.data.i32 && !(configs.count % 4)) {
+            int camera_score = INT_MIN, width = 0, height = 0;
             for (uint32_t j = 0; j + 3 < configs.count; j += 4) {
                 const int *data = configs.data.i32 + j;
                 const int w = data[1], h = data[2];
@@ -106,20 +342,31 @@ static int choose_camera(ACameraManager *manager, char **id, int *width, int *he
                 const int exact = w == 640 && h == 480;
                 const int aspect = abs(w * 3 - h * 4) < w / 8;
                 const int score = back * 100000000 + exact * 10000000 + aspect * 1000000 - w * h;
-                if (score <= best_score) continue;
-                char *copy = strdup(ids->cameraIds[i]);
-                if (!copy) { ACameraMetadata_free(metadata); ACameraManager_deleteCameraIdList(ids); return -ENOMEM; }
-                free(*id);
-                *id = copy;
-                *width = w;
-                *height = h;
-                best_score = score;
+                if (score > camera_score) { camera_score = score; width = w; height = h; }
+            }
+            if (camera_score != INT_MIN) {
+                uint32_t index = le32toh(out->count);
+                if (index == FAUXDEV_CAMERA_MAX_INPUTS) {
+                    ACameraMetadata_free(metadata);
+                    ACameraManager_deleteCameraIdList(ids);
+                    return -EOVERFLOW;
+                }
+                struct fauxdev_camera_input *input = &out->inputs[index];
+                input->facing = htole32(direction);
+                input->source_width = htole32((uint32_t)width);
+                input->source_height = htole32((uint32_t)height);
+                strcpy(input->id, id);
+                out->count = htole32(index + 1);
+                if (camera_score > best_score) {
+                    best_score = camera_score;
+                    out->default_index = htole32(index);
+                }
             }
         }
         ACameraMetadata_free(metadata);
     }
     ACameraManager_deleteCameraIdList(ids);
-    return *id ? 0 : -ENODEV;
+    return 0;
 }
 
 static void close_camera(struct camera *camera) {
@@ -193,7 +440,7 @@ static void *drain_frames(void *context) {
     return NULL;
 }
 
-static int open_camera(struct camera *camera) {
+static int open_camera(struct camera *camera, const struct fauxdev_camera_input *input) {
     atomic_init(&camera->failed, false);
     atomic_init(&camera->reader_stop, false);
     if (pthread_mutex_init(&camera->frame_lock, NULL) != 0) return -ENOMEM;
@@ -202,25 +449,22 @@ static int open_camera(struct camera *camera) {
     if (!camera->transfer_frame) return -ENOMEM;
     camera->manager = ACameraManager_create();
     if (!camera->manager) return -EIO;
-    char *id = NULL;
-    int width = 0, height = 0;
-    int result = choose_camera(camera->manager, &id, &width, &height);
-    if (result < 0) return result;
+    const char *id = input->id;
+    const int width = (int)le32toh(input->source_width);
+    const int height = (int)le32toh(input->source_height);
     fprintf(stderr, "fauxdev camera %s: %dx%d YUV -> %dx%d RGB24\n",
             id, width, height, OUTPUT_WIDTH, OUTPUT_HEIGHT);
     if (AImageReader_new(width, height, AIMAGE_FORMAT_YUV_420_888, 2, &camera->reader) != AMEDIA_OK) {
-        free(id);
         return -EIO;
     }
     ANativeWindow *window = NULL;
-    if (AImageReader_getWindow(camera->reader, &window) != AMEDIA_OK) { free(id); return -EIO; }
+    if (AImageReader_getWindow(camera->reader, &window) != AMEDIA_OK) return -EIO;
     ACameraDevice_StateCallbacks device_callbacks = {
         .context = camera,
         .onDisconnected = on_device_disconnected,
         .onError = on_device_error,
     };
     camera_status_t status = ACameraManager_openCamera(camera->manager, id, &device_callbacks, &camera->device);
-    free(id);
     if (status != ACAMERA_OK) {
         fprintf(stderr, "fauxdev camera open failed: %d\n", status);
         return status == ACAMERA_ERROR_PERMISSION_DENIED ? -EACCES : -EIO;
@@ -285,20 +529,28 @@ static int capture_frame(struct camera *camera, int client, uint8_t output[OUTPU
     return -ETIMEDOUT;
 }
 
-static int capture_to_fd(struct camera *camera, int client, const struct fauxdev_message *message) {
+static int validate_frame_request(const struct fauxdev_message *message,
+                                  struct fauxdev_video_frame_request *frame) {
     if (message->payload_size != sizeof(struct fauxdev_video_frame_request) || message->fd_count != 1)
         return -EINVAL;
-    struct fauxdev_video_frame_request frame;
-    memcpy(&frame, message->payload, sizeof(frame));
-    const uint32_t offset = le32toh(frame.offset);
-    if (le32toh(frame.width) != OUTPUT_WIDTH || le32toh(frame.height) != OUTPUT_HEIGHT ||
-        le32toh(frame.stride) != OUTPUT_WIDTH * 3 ||
-        le32toh(frame.pixel_format) != V4L2_PIX_FMT_RGB24 || le32toh(frame.size) != OUTPUT_SIZE)
+    memcpy(frame, message->payload, sizeof(*frame));
+    const uint32_t offset = le32toh(frame->offset);
+    if (le32toh(frame->width) != OUTPUT_WIDTH || le32toh(frame->height) != OUTPUT_HEIGHT ||
+        le32toh(frame->stride) != OUTPUT_WIDTH * 3 ||
+        le32toh(frame->pixel_format) != V4L2_PIX_FMT_RGB24 || le32toh(frame->size) != OUTPUT_SIZE)
         return -EINVAL;
     struct stat statbuf;
     if (fstat(message->fds[0], &statbuf) < 0) return -errno;
     if (!S_ISREG(statbuf.st_mode) || offset > (uint64_t)statbuf.st_size ||
         OUTPUT_SIZE > (uint64_t)statbuf.st_size - offset) return -EINVAL;
+    return 0;
+}
+
+static int capture_to_fd(struct camera *camera, int client, const struct fauxdev_message *message) {
+    struct fauxdev_video_frame_request frame;
+    int validation = validate_frame_request(message, &frame);
+    if (validation < 0) return validation;
+    const uint32_t offset = le32toh(frame.offset);
     uint8_t *pixels = camera->transfer_frame;
     int result = capture_frame(camera, client, pixels);
     if (result < 0) return result;
@@ -314,7 +566,116 @@ static int capture_to_fd(struct camera *camera, int client, const struct fauxdev
     return 0;
 }
 
-static int serve_client(int client, struct camera *camera) {
+struct inventory_cache {
+    char *text;
+    size_t size;
+};
+
+struct client_camera_state {
+    struct fauxdev_camera_inputs_reply *inputs;
+    struct camera *active;
+    bool explicit_lifecycle;
+};
+
+static int load_inputs(struct client_camera_state *state) {
+    if (state->inputs) return 0;
+    state->inputs = calloc(1, sizeof(*state->inputs));
+    if (!state->inputs) return -ENOMEM;
+    ACameraManager *manager = ACameraManager_create();
+    if (!manager) { free(state->inputs); state->inputs = NULL; return -EIO; }
+    int result = collect_inputs(manager, state->inputs);
+    ACameraManager_delete(manager);
+    if (result < 0) { free(state->inputs); state->inputs = NULL; }
+    return result;
+}
+
+static int serve_inputs(const struct fauxdev_message *request, struct fauxdev_message *response,
+                        struct client_camera_state *state) {
+    if (request->payload_size || request->fd_count) return -EINVAL;
+    int result = load_inputs(state);
+    if (result < 0) return result;
+    uint32_t count = le32toh(state->inputs->count);
+    response->payload_size = offsetof(struct fauxdev_camera_inputs_reply, inputs) +
+                             count * sizeof(struct fauxdev_camera_input);
+    memcpy(response->payload, state->inputs, response->payload_size);
+    return 0;
+}
+
+static int start_camera(struct client_camera_state *state, uint32_t index) {
+    if (state->active) return -EBUSY;
+    int result = load_inputs(state);
+    if (result < 0) return result;
+    if (index >= le32toh(state->inputs->count)) return -EINVAL;
+    struct camera *camera = calloc(1, sizeof(*camera));
+    if (!camera) return -ENOMEM;
+    result = open_camera(camera, &state->inputs->inputs[index]);
+    if (result < 0) {
+        close_camera(camera);
+        free(camera);
+        return result;
+    }
+    state->active = camera;
+    return 0;
+}
+
+static int serve_start(const struct fauxdev_message *request, struct client_camera_state *state) {
+    if (request->payload_size != sizeof(struct fauxdev_camera_start_request) || request->fd_count)
+        return -EINVAL;
+    struct fauxdev_camera_start_request start;
+    memcpy(&start, request->payload, sizeof(start));
+    return start_camera(state, le32toh(start.index));
+}
+
+static int serve_legacy_frame(int client, const struct fauxdev_message *request,
+                              struct client_camera_state *state) {
+    if (!state->active) {
+        if (state->explicit_lifecycle) return -EPIPE;
+        struct fauxdev_video_frame_request frame;
+        int result = validate_frame_request(request, &frame);
+        if (result < 0) return result;
+        result = load_inputs(state);
+        if (result < 0) return result;
+        if (!le32toh(state->inputs->count)) return -ENODEV;
+        result = start_camera(state, le32toh(state->inputs->default_index));
+        if (result < 0) return result;
+    }
+    return capture_to_fd(state->active, client, request);
+}
+
+static int serve_stop(const struct fauxdev_message *request, struct client_camera_state *state) {
+    if (request->payload_size || request->fd_count) return -EINVAL;
+    if (state->active) {
+        close_camera(state->active);
+        free(state->active);
+        state->active = NULL;
+    }
+    return 0;
+}
+
+static int serve_inventory(const struct fauxdev_message *request,
+                           struct fauxdev_message *response, struct inventory_cache *cache) {
+    if (request->payload_size != sizeof(struct fauxdev_inventory_request) || request->fd_count)
+        return -EINVAL;
+    struct fauxdev_inventory_request wire_request;
+    memcpy(&wire_request, request->payload, sizeof(wire_request));
+    uint32_t offset = le32toh(wire_request.offset);
+    if (!cache->text) {
+        int result = inventory_snapshot(&cache->text, &cache->size);
+        if (result < 0) return result;
+    }
+    if (offset >= cache->size) return -EINVAL;
+    size_t chunk = cache->size - offset;
+    if (chunk > 60 * 1024) chunk = 60 * 1024;
+    struct fauxdev_inventory_reply header = {
+        .total = htole32((uint32_t)cache->size), .offset = htole32(offset),
+    };
+    memcpy(response->payload, &header, sizeof(header));
+    memcpy(response->payload + sizeof(header), cache->text + offset, chunk);
+    response->payload_size = sizeof(header) + chunk;
+    return 0;
+}
+
+static int serve_client(int client, struct client_camera_state *state, struct inventory_cache *cache) {
     struct ucred peer;
     socklen_t peer_size = sizeof(peer);
     if (getsockopt(client, SOL_SOCKET, SO_PEERCRED, &peer, &peer_size) < 0 ||
@@ -336,15 +697,37 @@ static int serve_client(int client, struct camera *camera) {
             return errno == ECONNRESET ? 0 : -errno;
         fprintf(stderr, "fauxdev camera request opcode=%u payload=%zu fds=%zu at %lldms\n",
                 request.opcode, request.payload_size, request.fd_count, (long long)monotonic_ms());
-        const int status = request.opcode == FAUXDEV_OPCODE_VIDEO_FRAME
-            ? capture_to_fd(camera, client, &request) : -ENOTTY;
+        response = (struct fauxdev_message){
+            .opcode = request.opcode, .flags = FAUXDEV_MESSAGE_RESPONSE,
+            .request_id = request.request_id,
+        };
+        int status;
+        switch (request.opcode) {
+        case FAUXDEV_OPCODE_VIDEO_FRAME:
+            status = serve_legacy_frame(client, &request, state);
+            break;
+        case FAUXDEV_OPCODE_CAMERA_INVENTORY:
+            status = serve_inventory(&request, &response, cache);
+            break;
+        case FAUXDEV_OPCODE_CAMERA_INPUTS:
+            status = serve_inputs(&request, &response, state);
+            break;
+        case FAUXDEV_OPCODE_CAMERA_START:
+            state->explicit_lifecycle = true;
+            status = serve_start(&request, state);
+            break;
+        case FAUXDEV_OPCODE_CAMERA_STOP:
+            state->explicit_lifecycle = true;
+            status = serve_stop(&request, state);
+            break;
+        default:
+            status = -ENOTTY;
+        }
         fprintf(stderr, "fauxdev camera request result: %d at %lldms\n",
                 status, (long long)monotonic_ms());
         fauxdev_message_close_fds(&request);
-        response = (struct fauxdev_message){
-            .opcode = request.opcode, .flags = FAUXDEV_MESSAGE_RESPONSE,
-            .request_id = request.request_id, .status = status,
-        };
+        response.status = status;
+        if (status < 0) response.payload_size = 0;
         if (fauxdev_message_send(client, &response) < 0) return -errno;
         fprintf(stderr, "fauxdev camera reply sent at %lldms\n", (long long)monotonic_ms());
     }
@@ -362,29 +745,18 @@ static int run_server(const char *socket_path) {
     server_state = 1;
     pthread_mutex_unlock(&server_lock);
 
-    struct camera *camera = calloc(1, sizeof(*camera));
-    if (!camera) {
-        pthread_mutex_lock(&server_lock);
-        server_state = 0;
-        pthread_mutex_unlock(&server_lock);
-        return -ENOMEM;
-    }
-    int result = open_camera(camera);
-    if (result < 0) {
-        fprintf(stderr, "fauxdev camera unavailable: %d\n", result);
-        goto finish_camera;
-    }
+    int result;
     struct sockaddr_un address = {.sun_family = AF_UNIX};
-    if (strlen(socket_path) >= sizeof(address.sun_path)) { result = -ENAMETOOLONG; goto finish_camera; }
+    if (strlen(socket_path) >= sizeof(address.sun_path)) { result = -ENAMETOOLONG; goto finish_server; }
     strcpy(address.sun_path, socket_path);
     struct stat existing;
     if (lstat(socket_path, &existing) == 0) {
         if (!S_ISSOCK(existing.st_mode) || existing.st_uid != geteuid() || unlink(socket_path) < 0) {
-            result = -EACCES; goto finish_camera;
+            result = -EACCES; goto finish_server;
         }
-    } else if (errno != ENOENT) { result = -errno; goto finish_camera; }
+    } else if (errno != ENOENT) { result = -errno; goto finish_server; }
     int listener = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-    if (listener < 0) { result = -errno; goto finish_camera; }
+    if (listener < 0) { result = -errno; goto finish_server; }
     if (bind(listener, (const struct sockaddr *)&address,
              offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1) < 0 ||
         chmod(socket_path, 0600) < 0 || listen(listener, 1) < 0) {
@@ -419,7 +791,12 @@ static int run_server(const char *socket_path) {
             const int client_stopped = server_state == 2;
             pthread_mutex_unlock(&server_lock);
             if (!client_stopped) {
-                int session_status = serve_client(client, camera);
+                struct inventory_cache cache = {0};
+                struct client_camera_state state = {0};
+                int session_status = serve_client(client, &state, &cache);
+                if (state.active) { close_camera(state.active); free(state.active); }
+                free(state.inputs);
+                free(cache.text);
                 if (session_status < 0 && session_status != -ECANCELED)
                     fprintf(stderr, "fauxdev camera client error: %d\n", session_status);
             }
@@ -436,9 +813,7 @@ static int run_server(const char *socket_path) {
     close(listener);
 finish_socket:
     unlink(socket_path);
-finish_camera:
-    close_camera(camera);
-    free(camera);
+finish_server:
     pthread_mutex_lock(&server_lock);
     server_state = 0;
     pthread_mutex_unlock(&server_lock);

@@ -10,10 +10,15 @@ TEST := $(BUILD)/probe-client
 TRANSPORT_TEST := $(BUILD)/transport-client
 VIDEO_TEST := $(BUILD)/video-client
 VIDEO_BROKER_TEST := $(BUILD)/video-broker-client
+INVENTORY_TOOL := $(BUILD)/fauxdev-camera-info
+INVENTORY_TEST := $(BUILD)/inventory-client-test
+CAMERA_SELECT_TEST := $(BUILD)/camera-selection-client
+CAMERA_SELECT_BROKER_TEST := $(BUILD)/camera-selection-broker-test
+LEGACY_BROKER_TEST := $(BUILD)/legacy-broker-client
 
 .PHONY: all test clean
 
-all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST)
+all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST) $(INVENTORY_TOOL) $(INVENTORY_TEST) $(CAMERA_SELECT_TEST) $(CAMERA_SELECT_BROKER_TEST) $(LEGACY_BROKER_TEST)
 
 $(BUILD):
 	mkdir -p $@
@@ -33,11 +38,28 @@ $(VIDEO_TEST): tests/video_client.c | $(BUILD)
 $(VIDEO_BROKER_TEST): tests/video_broker_client.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/video_broker_client.c src/transport.c -o $@ $(LDFLAGS)
 
+$(INVENTORY_TOOL): tools/camera_inventory.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tools/camera_inventory.c src/transport.c -o $@ $(LDFLAGS)
+
+$(INVENTORY_TEST): tests/inventory_client_test.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/inventory_client_test.c src/transport.c -o $@ $(LDFLAGS)
+
+$(CAMERA_SELECT_TEST): tests/camera_selection_client.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/camera_selection_client.c -o $@ $(LDFLAGS)
+
+$(CAMERA_SELECT_BROKER_TEST): tests/camera_selection_broker_test.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/camera_selection_broker_test.c src/transport.c -o $@ $(LDFLAGS)
+
+$(LEGACY_BROKER_TEST): tests/legacy_broker_client.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/legacy_broker_client.c src/transport.c -o $@ $(LDFLAGS)
+
 test: all
 	LD_PRELOAD=$(abspath $(LIB)) $(TEST)
 	$(TRANSPORT_TEST)
 	LD_PRELOAD=$(abspath $(LIB)) $(VIDEO_TEST)
 	LD_PRELOAD=$(abspath $(LIB)) $(VIDEO_BROKER_TEST)
+	$(INVENTORY_TEST) $(abspath $(INVENTORY_TOOL))
+	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_SELECT_BROKER_TEST)
 
 clean:
 	rm -rf $(BUILD)

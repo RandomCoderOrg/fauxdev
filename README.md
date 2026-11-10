@@ -32,6 +32,33 @@ Queueing is asynchronous, and blocking dequeue waits for completion or
 disconnect. A visible `/dev/video0` directory entry still needs a
 deployment-created placeholder.
 
+The read-only `fauxdev-camera-info` command reports Camera2 metadata through
+the same broker connection. Build it with `make build/fauxdev-camera-info`
+(use `CC=clang` in native Termux), then run it through the app's FD launcher,
+for example `camera2termux-run /path/to/fauxdev-camera-info`. It accepts the
+inherited `FAUXDEV_VIDEO_FD`; the older same-UID socket path also works through
+`FAUXDEV_VIDEO_SOCKET`. The report describes device metadata, not implemented
+V4L2 modes or controls. It does not open another camera; the broker must be
+running, but the camera stays closed until streaming starts.
+
+With a current broker, `/dev/video0` enumerates compatible Camera2 inputs.
+`VIDIOC_S_INPUT` selects one before buffers are allocated; `VIDIOC_STREAMON`
+opens it and reports an open failure to the caller. `VIDIOC_STREAMOFF` releases
+the camera while retaining the connection for another selection/stream. It may
+wait up to 20 seconds for an in-flight frame request to finish. The
+output remains 320×240 RGB24. `build/camera-selection-client` exercises each
+input on one descriptor and prints a frame hash; use it through
+`camera2termux-run` for a device check. Pass an optional output prefix (for
+example `/sdcard/Download/camera`) to save `camera-0.ppm`, `camera-1.ppm`, etc.
+for visual inspection. Without the prefix, it writes no files. A listed input
+can become unavailable before it is opened.
+
+Older protocol-v1 clients that send `HELLO` followed directly by a valid
+`VIDEO_FRAME` still open the default camera on that first frame. Once a client
+sends `CAMERA_START` or `CAMERA_STOP`, it uses the explicit lifecycle; frames
+after a stop require another start. `build/legacy-broker-client` checks the old
+request sequence against a running broker through `camera2termux-run`.
+
 Run the acceptance suite on Linux with:
 
 ```sh
