@@ -403,7 +403,7 @@ static int video_ioctl(
             uint32_t facing = le32toh(s->inputs[index].facing);
             const char *label = facing == 0 ? "Front" : facing == 1 ? "Rear" :
                                 facing == 2 ? "External" : "Unknown";
-            snprintf((char *)input->name, sizeof(input->name), "%s camera %.20s", label,
+            snprintf((char *)input->name, sizeof(input->name), "%s camera %.15s", label,
                      s->inputs[index].id);
         } else memcpy(input->name, s->broker ? "Camera2 preview" : "fauxdev test pattern",
                       s->broker ? 16 : 21);
