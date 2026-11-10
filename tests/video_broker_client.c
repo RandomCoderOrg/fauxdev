@@ -79,13 +79,15 @@ static void *broker(void *argument) {
         assert(fauxdev_message_receive(socket_fd, &request) == 0);
         assert(request.opcode == FAUXDEV_OPCODE_HELLO && request.fd_count == 0);
         reply(socket_fd, &request);
-        assert(fauxdev_message_receive(socket_fd, &request) == 0);
-        assert(request.opcode == FAUXDEV_OPCODE_CAMERA_INPUTS && !request.payload_size && !request.fd_count);
-        struct fauxdev_message unsupported = {
-            .opcode = request.opcode, .flags = FAUXDEV_MESSAGE_RESPONSE,
-            .request_id = request.request_id, .status = -ENOTTY,
-        };
-        assert(fauxdev_message_send(socket_fd, &unsupported) == 0);
+        if (turn == 0) {
+            assert(fauxdev_message_receive(socket_fd, &request) == 0);
+            assert(request.opcode == FAUXDEV_OPCODE_CAMERA_INPUTS && !request.payload_size && !request.fd_count);
+            struct fauxdev_message unsupported = {
+                .opcode = request.opcode, .flags = FAUXDEV_MESSAGE_RESPONSE,
+                .request_id = request.request_id, .status = -ENOTTY,
+            };
+            assert(fauxdev_message_send(socket_fd, &unsupported) == 0);
+        }
         assert(fauxdev_message_receive(socket_fd, &request) == 0);
         assert(request.opcode == FAUXDEV_OPCODE_VIDEO_FRAME);
         assert(request.payload_size == sizeof(struct fauxdev_video_frame_request));
