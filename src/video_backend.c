@@ -320,6 +320,8 @@ static void *produce_frames(void *data) {
 }
 
 static int stop_worker(struct video_session *s, int release) {
+    // Legacy brokers have no STOP request, so close their connection between streams.
+    const int discard_broker = release || !s->camera_selection_supported;
     pthread_mutex_lock(&s->lock);
     s->streaming = 0;
     s->stream_generation++;
@@ -329,7 +331,7 @@ static int stop_worker(struct video_session *s, int release) {
     const int started = s->worker_started;
     pthread_mutex_unlock(&s->lock);
     // shortcut: STREAMOFF may wait for one in-flight frame (at most the transport timeout); a cancellable request would reduce this latency.
-    if (release) fauxdev_transport_cancel(broker);
+    if (discard_broker) fauxdev_transport_cancel(broker);
     if (started) pthread_join(s->worker, NULL);
     int result = 0, saved_errno = 0;
     if (!release && s->camera_started && broker) {
@@ -344,7 +346,7 @@ static int stop_worker(struct video_session *s, int release) {
         if (result < 0) fauxdev_transport_cancel(broker);
     }
     pthread_mutex_lock(&s->lock);
-    if (release) s->broker = NULL;
+    if (discard_broker) s->broker = NULL;
     s->worker_started = 0;
     s->worker_stop = 0;
     s->camera_started = 0;
@@ -352,7 +354,7 @@ static int stop_worker(struct video_session *s, int release) {
     s->done_count = 0;
     memset(s->state, 0, sizeof(s->state));
     pthread_mutex_unlock(&s->lock);
-    if (release) fauxdev_transport_destroy(broker);
+    if (discard_broker) fauxdev_transport_destroy(broker);
     pthread_mutex_lock(&s->lock);
     drain(s);
     pthread_mutex_unlock(&s->lock);
