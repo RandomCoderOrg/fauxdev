@@ -44,6 +44,12 @@ int main(void) {
     assert(duplicate >= 0);
     assert(close(fd) == 0);
     fd = duplicate;
+    unsigned char *anonymous = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, fd, 0);
+    assert(anonymous != MAP_FAILED);
+    anonymous[0] = 0x5a;
+    assert(anonymous[0] == 0x5a);
+    assert(munmap(anonymous, 4096) == 0);
     struct v4l2_capability cap = {0};
     assert(ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0);
     assert((cap.device_caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING)) ==

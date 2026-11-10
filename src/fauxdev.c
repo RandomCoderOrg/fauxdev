@@ -580,6 +580,9 @@ int close(int fd) {
 }
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    /* Scudo may map anonymously while a binding allocation holds registry_lock. */
+    if (fd < 0 || (flags & MAP_ANONYMOUS))
+        return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
     pthread_mutex_lock(&registry_lock);
     struct fauxdev_binding *binding = find_binding_locked(fd);
     if (!binding) {
