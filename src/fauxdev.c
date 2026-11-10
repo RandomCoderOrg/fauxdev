@@ -538,7 +538,11 @@ static void release_session(struct fauxdev_session *session, int operation_fd) {
     destroy_session(destroy);
 }
 
+#ifdef __BIONIC__
+int ioctl(int fd, int request, ...) {
+#else
 int ioctl(int fd, unsigned long request, ...) {
+#endif
     va_list arguments;
     va_start(arguments, request);
     void *argument = va_arg(arguments, void *);
@@ -551,11 +555,11 @@ int ioctl(int fd, unsigned long request, ...) {
         acquire_session(fd, &operation_fd, &status_flags, &is_fake);
     if (!session) {
         if (is_fake) return -1;
-        return syscall(SYS_ioctl, fd, request, argument);
+        return syscall(SYS_ioctl, fd, (unsigned int)request, argument);
     }
     const int result =
         session->backend->ioctl(
-            session->backend_data, operation_fd, status_flags, request, argument
+            session->backend_data, operation_fd, status_flags, (unsigned int)request, argument
         );
     const int saved_errno = errno;
     release_session(session, operation_fd);
