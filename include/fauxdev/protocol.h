@@ -20,6 +20,17 @@ enum fauxdev_opcode {
     FAUXDEV_OPCODE_CAMERA_INPUTS = 4u,
     FAUXDEV_OPCODE_CAMERA_START = 5u,
     FAUXDEV_OPCODE_CAMERA_STOP = 6u,
+    FAUXDEV_OPCODE_CAMERA_MODES = 7u,
+    FAUXDEV_OPCODE_CAMERA_START_V2 = 8u,
+    FAUXDEV_OPCODE_CAMERA_GET_CONFIG = 9u,
+    FAUXDEV_OPCODE_CAMERA_SET_CONFIG = 10u,
+    FAUXDEV_OPCODE_CAMERA_ACQUIRE_QUEUE = 11u,
+    FAUXDEV_OPCODE_CAMERA_RELEASE_QUEUE = 12u,
+    FAUXDEV_OPCODE_CAMERA_GET_PRIORITY = 13u,
+    FAUXDEV_OPCODE_CAMERA_SET_PRIORITY = 14u,
+    FAUXDEV_OPCODE_CAMERA_ENUM_RATES = 15u,
+    FAUXDEV_OPCODE_CAMERA_GET_RATE = 16u,
+    FAUXDEV_OPCODE_CAMERA_SET_RATE = 17u,
 };
 
 #define FAUXDEV_CAMERA_MAX_INPUTS 64u
@@ -41,6 +52,60 @@ struct fauxdev_camera_inputs_reply {
 
 struct fauxdev_camera_start_request {
     uint32_t index;
+};
+
+/* Optional extensions to wire v1. Older brokers reply ENOTTY. */
+#define FAUXDEV_CAMERA_MODE_PAGE 64u
+struct fauxdev_camera_mode {
+    uint32_t width;
+    uint32_t height;
+};
+struct fauxdev_camera_modes_request {
+    uint32_t index;
+    uint32_t offset;
+};
+struct fauxdev_camera_modes_reply {
+    uint32_t total;
+    uint32_t offset;
+    struct fauxdev_camera_mode modes[FAUXDEV_CAMERA_MODE_PAGE];
+};
+struct fauxdev_camera_start_v2_request {
+    uint32_t index;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct fauxdev_camera_config {
+    uint64_t generation;
+    uint32_t index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t reserved;
+};
+struct fauxdev_camera_queue_request {
+    uint64_t generation;
+};
+struct fauxdev_camera_priority {
+    uint32_t value;
+    uint32_t enforce;
+};
+
+#define FAUXDEV_CAMERA_RATE_PAGE 64u
+struct fauxdev_camera_rates_request {
+    uint32_t index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t offset;
+};
+struct fauxdev_camera_rates_reply {
+    uint32_t total;
+    uint32_t offset;
+    uint32_t fps[FAUXDEV_CAMERA_RATE_PAGE];
+};
+struct fauxdev_camera_rate {
+    uint64_t generation;
+    uint32_t fps;
+    uint32_t reserved;
 };
 
 struct fauxdev_video_frame_request {
@@ -68,12 +133,24 @@ static_assert(sizeof(struct fauxdev_inventory_request) == 4, "unexpected invento
 static_assert(sizeof(struct fauxdev_inventory_reply) == 8, "unexpected inventory reply layout");
 static_assert(sizeof(struct fauxdev_camera_input) == 268, "unexpected camera input layout");
 static_assert(sizeof(struct fauxdev_camera_start_request) == 4, "unexpected camera start layout");
+static_assert(sizeof(struct fauxdev_camera_mode) == 8, "unexpected camera mode layout");
+static_assert(sizeof(struct fauxdev_camera_start_v2_request) == 12, "unexpected camera start v2 layout");
+static_assert(sizeof(struct fauxdev_camera_config) == 24, "unexpected camera config layout");
+static_assert(sizeof(struct fauxdev_camera_queue_request) == 8, "unexpected queue layout");
+static_assert(sizeof(struct fauxdev_camera_rates_request) == 16, "unexpected rate request layout");
+static_assert(sizeof(struct fauxdev_camera_rate) == 16, "unexpected rate layout");
 #else
 _Static_assert(sizeof(struct fauxdev_video_frame_request) == 24, "unexpected video request layout");
 _Static_assert(sizeof(struct fauxdev_inventory_request) == 4, "unexpected inventory request layout");
 _Static_assert(sizeof(struct fauxdev_inventory_reply) == 8, "unexpected inventory reply layout");
 _Static_assert(sizeof(struct fauxdev_camera_input) == 268, "unexpected camera input layout");
 _Static_assert(sizeof(struct fauxdev_camera_start_request) == 4, "unexpected camera start layout");
+_Static_assert(sizeof(struct fauxdev_camera_mode) == 8, "unexpected camera mode layout");
+_Static_assert(sizeof(struct fauxdev_camera_start_v2_request) == 12, "unexpected camera start v2 layout");
+_Static_assert(sizeof(struct fauxdev_camera_config) == 24, "unexpected camera config layout");
+_Static_assert(sizeof(struct fauxdev_camera_queue_request) == 8, "unexpected queue layout");
+_Static_assert(sizeof(struct fauxdev_camera_rates_request) == 16, "unexpected rate request layout");
+_Static_assert(sizeof(struct fauxdev_camera_rate) == 16, "unexpected rate layout");
 #endif
 
 struct fauxdev_wire_header {

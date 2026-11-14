@@ -173,6 +173,8 @@ int fauxdev_message_receive(int socket_fd, struct fauxdev_message *message) {
 
 static void mark_disconnected(struct fauxdev_transport *transport) {
     if (atomic_exchange_explicit(&transport->disconnected, true, memory_order_acq_rel)) return;
+    // A timed-out mutating request may have committed; disconnect so the broker drops its lease.
+    if (transport->socket_fd >= 0) shutdown(transport->socket_fd, SHUT_RDWR);
     const uint64_t token = 1;
     while (syscall(SYS_write, transport->readiness_fd, &token, sizeof(token)) < 0 &&
            errno == EINTR) {}
@@ -241,8 +243,13 @@ int fauxdev_transport_request(
         /* Android may forbid changing options on a socket passed from another app. */
         struct pollfd ready = {.fd = transport->socket_fd, .events = POLLIN};
         do {
-            int timeout = opcode == FAUXDEV_OPCODE_VIDEO_FRAME ? 20000 :
-                          opcode == FAUXDEV_OPCODE_CAMERA_START ? 10000 :
+            int timeout = opcode == FAUXDEV_OPCODE_VIDEO_FRAME ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_STOP ? 20000 :
+                          opcode == FAUXDEV_OPCODE_CAMERA_START ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_START_V2 ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_SET_CONFIG ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_ENUM_RATES ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_SET_RATE ? 10000 :
                           opcode == FAUXDEV_OPCODE_CAMERA_INPUTS ? 5000 : 2000;
             result = poll(&ready, 1, timeout);
         } while (result < 0 && errno == EINTR);
@@ -379,7 +386,6 @@ bool fauxdev_transport_disconnected(const struct fauxdev_transport *transport) {
 void fauxdev_transport_cancel(struct fauxdev_transport *transport) {
     if (!transport) return;
     mark_disconnected(transport);
-    if (transport->socket_fd >= 0) shutdown(transport->socket_fd, SHUT_RDWR);
 }
 
 void fauxdev_transport_destroy(struct fauxdev_transport *transport) {

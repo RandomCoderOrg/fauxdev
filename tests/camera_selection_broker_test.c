@@ -92,6 +92,10 @@ static void *mock_broker(void *argument) {
                 respond(fd, &request, 0, NULL, 0);
             }
             break;
+        case FAUXDEV_OPCODE_CAMERA_MODES:
+        case FAUXDEV_OPCODE_CAMERA_GET_CONFIG:
+            respond(fd, &request, -ENOTTY, NULL, 0);
+            break;
         default:
             assert(0 && "unexpected opcode");
         }
@@ -112,6 +116,10 @@ static void *ambiguous_start_broker(void *argument) {
     strcpy(list.inputs[0].id, "rear");
     respond(fd, &request, 0, &list,
             offsetof(struct fauxdev_camera_inputs_reply, inputs) + sizeof(list.inputs[0]));
+    assert(fauxdev_message_receive(fd, &request) == 0 && request.opcode == FAUXDEV_OPCODE_CAMERA_MODES);
+    respond(fd, &request, -ENOTTY, NULL, 0);
+    assert(fauxdev_message_receive(fd, &request) == 0 && request.opcode == FAUXDEV_OPCODE_CAMERA_GET_CONFIG);
+    respond(fd, &request, -ENOTTY, NULL, 0);
     assert(fauxdev_message_receive(fd, &request) == 0 && request.opcode == FAUXDEV_OPCODE_CAMERA_START);
     struct fauxdev_message bad_reply = {
         .opcode = FAUXDEV_OPCODE_CAMERA_START, .flags = FAUXDEV_MESSAGE_RESPONSE,
@@ -182,6 +190,17 @@ int main(void) {
     assert(ioctl(fd, VIDIOC_ENUMINPUT, &input) == -1 && errno == EINVAL);
     int selected = -1;
     assert(ioctl(fd, VIDIOC_G_INPUT, &selected) == 0 && selected == 1);
+    struct v4l2_frmsizeenum size = {.pixel_format = V4L2_PIX_FMT_RGB24};
+    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0);
+    assert(size.type == V4L2_FRMSIZE_TYPE_DISCRETE &&
+           size.discrete.width == 320 && size.discrete.height == 240);
+    size.index = 1;
+    errno = 0;
+    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1 && errno == EINVAL);
+    size.index = 0;
+    size.pixel_format = V4L2_PIX_FMT_NV12;
+    errno = 0;
+    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1 && errno == EINVAL);
     selected = 3;
     errno = 0;
     assert(ioctl(fd, VIDIOC_S_INPUT, &selected) == -1 && errno == EINVAL);

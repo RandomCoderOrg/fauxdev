@@ -17,6 +17,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef __ANDROID__
+#include <dlfcn.h>
+/* Bionic headers omit these functions, which fauxdev provides for this test. */
+int close_range(unsigned int first, unsigned int last, int flags);
+#endif
+
 static void require_probe_metadata(int fd) {
     struct stat status;
     assert(fstat(fd, &status) == 0);
@@ -241,7 +247,13 @@ static void test_closefrom_cleanup(void) {
     assert(fd >= 0);
     int high = fcntl(fd, F_DUPFD, 128);
     assert(high >= 128);
+#ifdef __ANDROID__
+    void (*closefrom_fn)(int) = dlsym(RTLD_DEFAULT, "closefrom");
+    assert(closefrom_fn);
+    closefrom_fn(high);
+#else
     closefrom(high);
+#endif
     assert(fcntl(high, F_GETFD) == -1 && errno == EBADF);
 
     uint32_t version = 0;

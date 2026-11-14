@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/close_range.h>
+#include <linux/videodev2.h>
 #include <linux/stat.h>
 #include <poll.h>
 #include <pthread.h>
@@ -543,10 +544,13 @@ int ioctl(int fd, int request, ...) {
 #else
 int ioctl(int fd, unsigned long request, ...) {
 #endif
-    va_list arguments;
-    va_start(arguments, request);
-    void *argument = va_arg(arguments, void *);
-    va_end(arguments);
+    void *argument = NULL;
+    if (request != VIDIOC_LOG_STATUS) {
+        va_list arguments;
+        va_start(arguments, request);
+        argument = va_arg(arguments, void *);
+        va_end(arguments);
+    }
 
     int operation_fd = -1;
     int status_flags = 0;

@@ -15,10 +15,13 @@ INVENTORY_TEST := $(BUILD)/inventory-client-test
 CAMERA_SELECT_TEST := $(BUILD)/camera-selection-client
 CAMERA_SELECT_BROKER_TEST := $(BUILD)/camera-selection-broker-test
 LEGACY_BROKER_TEST := $(BUILD)/legacy-broker-client
+MULTIOPEN_TEST := $(BUILD)/video-multiopen-client
+CAMERA_MODES_TEST := $(BUILD)/camera-modes-broker-test
+CAMERA_GLOBAL_TEST := $(BUILD)/camera-global-broker-test
 
 .PHONY: all test clean
 
-all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST) $(INVENTORY_TOOL) $(INVENTORY_TEST) $(CAMERA_SELECT_TEST) $(CAMERA_SELECT_BROKER_TEST) $(LEGACY_BROKER_TEST)
+all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST) $(INVENTORY_TOOL) $(INVENTORY_TEST) $(CAMERA_SELECT_TEST) $(CAMERA_SELECT_BROKER_TEST) $(LEGACY_BROKER_TEST) $(MULTIOPEN_TEST) $(CAMERA_MODES_TEST) $(CAMERA_GLOBAL_TEST)
 
 $(BUILD):
 	mkdir -p $@
@@ -53,6 +56,15 @@ $(CAMERA_SELECT_BROKER_TEST): tests/camera_selection_broker_test.c src/transport
 $(LEGACY_BROKER_TEST): tests/legacy_broker_client.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/legacy_broker_client.c src/transport.c -o $@ $(LDFLAGS)
 
+$(MULTIOPEN_TEST): tests/video_multiopen_client.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/video_multiopen_client.c src/transport.c -o $@ $(LDFLAGS)
+
+$(CAMERA_MODES_TEST): tests/camera_modes_broker_test.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/camera_modes_broker_test.c src/transport.c -o $@ $(LDFLAGS)
+
+$(CAMERA_GLOBAL_TEST): tests/camera_global_broker_test.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/camera_global_broker_test.c src/transport.c -o $@ $(LDFLAGS)
+
 test: all
 	LD_PRELOAD=$(abspath $(LIB)) $(TEST)
 	$(TRANSPORT_TEST)
@@ -60,6 +72,9 @@ test: all
 	LD_PRELOAD=$(abspath $(LIB)) $(VIDEO_BROKER_TEST)
 	$(INVENTORY_TEST) $(abspath $(INVENTORY_TOOL))
 	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_SELECT_BROKER_TEST)
+	LD_PRELOAD=$(abspath $(LIB)) $(MULTIOPEN_TEST)
+	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_MODES_TEST)
+	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_GLOBAL_TEST)
 
 clean:
 	rm -rf $(BUILD)

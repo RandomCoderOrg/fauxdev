@@ -22,9 +22,9 @@ requests, file descriptors in both directions, sealed `memfd` mappings,
 backend error replies, and disconnect notification through a test `eventfd`.
 The probe device is not yet wired to this transport.
 
-`/dev/video0` is a separate V4L2 capture source with two MMAP
-buffers. The current dev-only clarity experiment produces deterministic
-320×240 RGB24 frames. Setting `FAUXDEV_VIDEO_SOCKET` connects it to a broker
+`/dev/video0` is a separate V4L2 RGB24 capture source with MMAP buffers
+(up to 64 slots within a 128 MiB aggregate budget). Without a broker it
+produces deterministic 320×240 test frames. Setting `FAUXDEV_VIDEO_SOCKET` connects it to a broker
 that writes into per-request staging FDs. An
 [Android Camera2 broker](android/README.md) runs
 inside a camera-authorized foreground app; the test broker remains synthetic.
@@ -41,12 +41,20 @@ inherited `FAUXDEV_VIDEO_FD`; the older same-UID socket path also works through
 V4L2 modes or controls. It does not open another camera; the broker must be
 running, but the camera stays closed until streaming starts.
 
-With a current broker, `/dev/video0` enumerates compatible Camera2 inputs.
+With a current broker, `/dev/video0` enumerates compatible Camera2 inputs and
+their ordinary `YUV_420_888` output sizes that fit a 64 MiB RGB24 frame.
+For each size, fixed AE target rates that fit its actual YUV source's minimum
+frame duration appear through `ENUM_FRAMEINTERVALS` and global `G/S_PARM`.
+These are camera targets, not a promise that RGB conversion and Termux delivery
+will match the sensor cadence.
+The broker owns input and format configuration across processes; allocating
+buffers leases the queue until they are released or the process disconnects.
 `VIDIOC_S_INPUT` selects one before buffers are allocated; `VIDIOC_STREAMON`
 opens it and reports an open failure to the caller. `VIDIOC_STREAMOFF` releases
 the camera while retaining the connection for another selection/stream. It may
 wait up to 20 seconds for an in-flight frame request to finish. The
-output remains 320×240 RGB24. `build/camera-selection-client` exercises each
+output is the selected RGB24 size (or a converted 320×240 fallback).
+`build/camera-selection-client` exercises each
 input on one descriptor and prints a frame hash; use it through
 `camera2termux-run` for a device check. Pass an optional output prefix (for
 example `/sdcard/Download/camera`) to save `camera-0.ppm`, `camera-1.ppm`, etc.
@@ -68,8 +76,8 @@ make test
 `fauxdev` is Linux-specific; build it in a Linux container or VM when working
 from macOS.
 
-On a Pixel 6a, the earlier 64×48 build delivered 180 distinct FFmpeg frames
-and a visible 90-second FFplay stream through uDroid Dev's PRoot. The new
-320×240 experiment still needs device QA and is not general V4L2 support; see
-[Pixel validation](docs/pixel-proot-validation.md) for the lower-buffering
-FFplay command and its latency limits.
+On a Pixel 6a, all 58 advertised rear/front modes produced a real frame,
+and the pinned live capture test completed 84/84 checks with no warnings.
+This does not establish full V4L2 support or compatibility on other devices.
+The older [Pixel validation](docs/pixel-proot-validation.md) records the
+earlier FFplay/PRoot experiment and its latency limits.

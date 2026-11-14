@@ -3,6 +3,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <linux/videodev2.h>
 #include <limits.h>
 #include <stdint.h>
@@ -11,6 +12,7 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 enum { WIDTH = 320, HEIGHT = 240, FRAME_SIZE = WIDTH * HEIGHT * 3 };
@@ -36,7 +38,11 @@ int main(void) {
     check(fauxdev_transport_request(broker, FAUXDEV_OPCODE_VIDEO_FRAME,
           NULL, 0, NULL, 0, &reply) == -1 && errno == EINVAL,
           "malformed legacy VIDEO_FRAME");
+#ifdef __ANDROID__
+    int frame_fd = syscall(SYS_memfd_create, "legacy-camera-frame", MFD_CLOEXEC);
+#else
     int frame_fd = memfd_create("legacy-camera-frame", MFD_CLOEXEC);
+#endif
     check(frame_fd >= 0 && ftruncate(frame_fd, FRAME_SIZE) == 0, "frame buffer");
     const struct fauxdev_video_frame_request frame = {
         .offset = htole32(0), .width = htole32(WIDTH), .height = htole32(HEIGHT),

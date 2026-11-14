@@ -1,5 +1,6 @@
 NDK_CC ?= aarch64-linux-android31-clang
 HOST_CC ?= cc
+TERMUX_CC ?= cc
 CFLAGS := -std=c11 -D_GNU_SOURCE -O2 -Wall -Wextra -Werror
 
 .PHONY: all test clean
@@ -15,5 +16,9 @@ test-yuv-rgb: test_yuv_rgb.c yuv_rgb.c yuv_rgb.h
 test: test-yuv-rgb
 	./test-yuv-rgb
 
+# Build inside native Termux to exercise the app's authenticated FD handoff.
+broker-client: tests/broker_client.c ../src/transport.c ../src/transport.h ../include/fauxdev/protocol.h
+	$(TERMUX_CC) $(CFLAGS) -I../include -I../src tests/broker_client.c ../src/transport.c -o $@ -pthread
+
 clean:
-	rm -f libfauxdev-camera.so test-yuv-rgb
+	rm -f libfauxdev-camera.so test-yuv-rgb broker-client

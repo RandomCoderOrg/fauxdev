@@ -27,6 +27,7 @@
 struct broker_fixture {
     int listener;
     int reply_to_hello;
+    int lease;
 };
 
 static void send_response(
@@ -85,7 +86,11 @@ static void *run_broker(void *data) {
     assert(request.payload_size == 0 && request.fd_count == 0);
 
     static const char contents[] = "fauxdev sealed transport buffer";
+#ifdef __ANDROID__
+    int buffer_fd = syscall(SYS_memfd_create, "fauxdev-probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+#else
     int buffer_fd = memfd_create("fauxdev-probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+#endif
     assert(buffer_fd >= 0);
     assert(ftruncate(buffer_fd, sizeof(contents)) == 0);
     assert(pwrite(buffer_fd, contents, sizeof(contents), 0) == sizeof(contents));
@@ -245,12 +250,15 @@ static void *run_silent_broker(void *data) {
     if (fixture->reply_to_hello) {
         send_response(socket_fd, &request, NULL, 0, NULL, 0, 0);
         assert(fauxdev_message_receive(socket_fd, &request) == 0);
-        assert(request.opcode == PROBE_MEMFD_OPCODE);
+        assert(request.opcode == FAUXDEV_OPCODE_CAMERA_ACQUIRE_QUEUE);
+        assert(request.payload_size == sizeof(struct fauxdev_camera_queue_request));
+        fixture->lease = 1; // Broker committed before its reply was lost.
     }
     struct pollfd descriptor = {.fd = socket_fd, .events = POLLIN};
     assert(poll(&descriptor, 1, 5000) == 1);
     char byte;
     assert(recv(socket_fd, &byte, 1, 0) == 0);
+    fixture->lease = 0; // Connection teardown releases the broker-side lease.
     close(socket_fd);
     return NULL;
 }
@@ -271,18 +279,28 @@ static void test_silent_broker_timeout(int reply_to_hello) {
     assert(pthread_create(&broker, NULL, run_silent_broker, &fixture) == 0);
     int readiness_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
     assert(readiness_fd >= 0);
+    int inherited = -1;
     if (reply_to_hello) {
-        struct fauxdev_transport *transport =
-            fauxdev_transport_connect(socket_path, readiness_fd);
+        inherited = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+        assert(inherited >= 0);
+        struct sockaddr_un address = {.sun_family = AF_UNIX};
+        strcpy(address.sun_path, socket_path);
+        assert(connect(inherited, (const struct sockaddr *)&address,
+                offsetof(struct sockaddr_un, sun_path) + strlen(socket_path) + 1) == 0);
+        struct fauxdev_transport *transport = fauxdev_transport_from_fd(inherited, readiness_fd);
         assert(transport);
         struct fauxdev_message response;
+        const struct fauxdev_camera_queue_request acquire = {.generation = htole64(1)};
         errno = 0;
         assert(fauxdev_transport_request(
-                   transport, PROBE_MEMFD_OPCODE, NULL, 0, NULL, 0, &response
+                   transport, FAUXDEV_OPCODE_CAMERA_ACQUIRE_QUEUE,
+                   &acquire, sizeof(acquire), NULL, 0, &response
                ) == -1);
         assert(errno == ETIMEDOUT);
         assert(fauxdev_transport_disconnected(transport));
         fauxdev_transport_destroy(transport);
+        // The launcher still owns this descriptor; shutdown of the transport dup must reach peer.
+        assert(fcntl(inherited, F_GETFD) >= 0);
     } else {
         errno = 0;
         assert(fauxdev_transport_connect(socket_path, readiness_fd) == NULL);
@@ -292,10 +310,49 @@ static void test_silent_broker_timeout(int reply_to_hello) {
     assert(poll(&readiness, 1, 0) == 1);
     assert(readiness.revents & POLLIN);
     assert(pthread_join(broker, NULL) == 0);
+    assert(fixture.lease == 0);
+    if (inherited >= 0) close(inherited);
     close(readiness_fd);
     close(fixture.listener);
     assert(unlink(socket_path) == 0);
     assert(rmdir(directory) == 0);
+}
+
+static void *run_slow_camera_broker(void *data) {
+    int fd = *(int *)data;
+    struct fauxdev_message request;
+    assert(fauxdev_message_receive(fd, &request) == 0 && request.opcode == FAUXDEV_OPCODE_HELLO);
+    send_response(fd, &request, NULL, 0, NULL, 0, 0);
+    assert(fauxdev_message_receive(fd, &request) == 0 &&
+           request.opcode == FAUXDEV_OPCODE_CAMERA_START_V2);
+    sleep(3);
+    send_response(fd, &request, NULL, 0, NULL, 0, 0);
+    assert(fauxdev_message_receive(fd, &request) == 0 &&
+           request.opcode == FAUXDEV_OPCODE_CAMERA_STOP);
+    sleep(3);
+    send_response(fd, &request, NULL, 0, NULL, 0, 0);
+    close(fd);
+    return NULL;
+}
+
+static void test_slow_camera_lifecycle(void) {
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0);
+    pthread_t broker;
+    assert(pthread_create(&broker, NULL, run_slow_camera_broker, &pair[0]) == 0);
+    int readiness = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    assert(readiness >= 0);
+    struct fauxdev_transport *transport = fauxdev_transport_from_fd(pair[1], readiness);
+    assert(transport);
+    struct fauxdev_message response;
+    assert(fauxdev_transport_request(transport, FAUXDEV_OPCODE_CAMERA_START_V2,
+                                    NULL, 0, NULL, 0, &response) == 0);
+    assert(fauxdev_transport_request(transport, FAUXDEV_OPCODE_CAMERA_STOP,
+                                    NULL, 0, NULL, 0, &response) == 0);
+    fauxdev_transport_destroy(transport);
+    close(pair[1]);
+    close(readiness);
+    assert(pthread_join(broker, NULL) == 0);
 }
 
 int main(void) {
@@ -304,6 +361,7 @@ int main(void) {
     test_transport(1);
     test_silent_broker_timeout(0);
     test_silent_broker_timeout(1);
+    test_slow_camera_lifecycle();
     puts("fauxdev transport tests passed");
     return 0;
 }
