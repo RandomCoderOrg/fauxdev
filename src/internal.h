@@ -22,6 +22,9 @@ struct fauxdev_backend {
     void (*release)(void *data);
 };
 
+__attribute__((visibility("hidden"))) void *fauxdev_raw_mmap(
+    void *addr, size_t length, int prot, int flags, int fd, off64_t offset);
+
 __attribute__((visibility("hidden"))) const struct fauxdev_backend *
 fauxdev_find_backend(const char *path);
 

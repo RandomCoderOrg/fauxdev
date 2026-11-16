@@ -25,6 +25,14 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+#ifdef SYS_newfstatat
+#define FAUXDEV_SYS_FSTATAT SYS_newfstatat
+#define FAUXDEV_SYS_FSTAT SYS_fstat
+#else
+#define FAUXDEV_SYS_FSTATAT SYS_fstatat64
+#define FAUXDEV_SYS_FSTAT SYS_fstat64
+#endif
+
 struct fauxdev_session {
     const struct fauxdev_backend *backend;
     void *backend_data;
@@ -211,7 +219,7 @@ int open(const char *path, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list arguments;
         va_start(arguments, flags);
-        mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, int);
         va_end(arguments);
     }
     return open_at_impl(AT_FDCWD, path, flags, mode);
@@ -222,7 +230,7 @@ int open64(const char *path, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list arguments;
         va_start(arguments, flags);
-        mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, int);
         va_end(arguments);
     }
     return open_at_impl(AT_FDCWD, path, flags, mode);
@@ -233,7 +241,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list arguments;
         va_start(arguments, flags);
-        mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, int);
         va_end(arguments);
     }
     return open_at_impl(dirfd, path, flags, mode);
@@ -244,7 +252,7 @@ int openat64(int dirfd, const char *path, int flags, ...) {
     if (flags & (O_CREAT | O_TMPFILE)) {
         va_list arguments;
         va_start(arguments, flags);
-        mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, int);
         va_end(arguments);
     }
     return open_at_impl(dirfd, path, flags, mode);
@@ -277,7 +285,7 @@ int stat(const char *path, struct stat *status) {
         fill_stat(backend, status);
         return 0;
     }
-    return syscall(SYS_newfstatat, AT_FDCWD, path, status, 0);
+    return syscall(FAUXDEV_SYS_FSTATAT, AT_FDCWD, path, status, 0);
 }
 
 int lstat(const char *path, struct stat *status) {
@@ -286,7 +294,7 @@ int lstat(const char *path, struct stat *status) {
         fill_stat(backend, status);
         return 0;
     }
-    return syscall(SYS_newfstatat, AT_FDCWD, path, status, AT_SYMLINK_NOFOLLOW);
+    return syscall(FAUXDEV_SYS_FSTATAT, AT_FDCWD, path, status, AT_SYMLINK_NOFOLLOW);
 }
 
 int fstat(int fd, struct stat *status) {
@@ -294,7 +302,7 @@ int fstat(int fd, struct stat *status) {
     const struct fauxdev_backend *backend = backend_for_fd_locked(fd);
     if (backend) fill_stat(backend, status);
     pthread_mutex_unlock(&registry_lock);
-    return backend ? 0 : syscall(SYS_fstat, fd, status);
+    return backend ? 0 : syscall(FAUXDEV_SYS_FSTAT, fd, status);
 }
 
 int fstatat(int dirfd, const char *path, struct stat *status, int flags) {
@@ -308,7 +316,7 @@ int fstatat(int dirfd, const char *path, struct stat *status, int flags) {
         backend = backend_at(dirfd, path);
         if (backend) fill_stat(backend, status);
     }
-    return backend ? 0 : syscall(SYS_newfstatat, dirfd, path, status, flags);
+    return backend ? 0 : syscall(FAUXDEV_SYS_FSTATAT, dirfd, path, status, flags);
 }
 
 static void fill_statx(const struct fauxdev_backend *backend, struct statx *status) {
@@ -583,15 +591,27 @@ int close(int fd) {
     return result;
 }
 
-void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+void *fauxdev_raw_mmap(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+#ifdef SYS_mmap
+    return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+#else
+    if (offset < 0 || offset % 4096) { errno = EINVAL; return MAP_FAILED; }
+    if ((uint64_t)offset / 4096 > ULONG_MAX) { errno = EOVERFLOW; return MAP_FAILED; }
+    return (void *)syscall(SYS_mmap2, addr, length, prot, flags, fd, (unsigned long)offset / 4096);
+#endif
+}
+
+void *fauxdev_mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset)
+    __asm__("mmap64");
+void *fauxdev_mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
     /* Scudo may map anonymously while a binding allocation holds registry_lock. */
     if (fd < 0 || (flags & MAP_ANONYMOUS))
-        return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+        return fauxdev_raw_mmap(addr, length, prot, flags, fd, offset);
     pthread_mutex_lock(&registry_lock);
     struct fauxdev_binding *binding = find_binding_locked(fd);
     if (!binding) {
         pthread_mutex_unlock(&registry_lock);
-        return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+        return fauxdev_raw_mmap(addr, length, prot, flags, fd, offset);
     }
     struct fauxdev_session *session = binding->session;
     if (!session->backend->mmap) {
@@ -599,15 +619,18 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         errno = ENODEV;
         return MAP_FAILED;
     }
-    void *result = session->backend->mmap(session->backend_data, addr, length, prot, flags, offset);
+    if ((off64_t)(off_t)offset != offset) {
+        pthread_mutex_unlock(&registry_lock);
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    void *result = session->backend->mmap(session->backend_data, addr, length, prot, flags, (off_t)offset);
     pthread_mutex_unlock(&registry_lock);
     return result;
 }
 
-void *fauxdev_mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset)
-    __asm__("mmap64");
-void *fauxdev_mmap64(void *addr, size_t length, int prot, int flags, int fd, off64_t offset) {
-    return mmap(addr, length, prot, flags, fd, offset);
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    return fauxdev_mmap64(addr, length, prot, flags, fd, offset);
 }
 
 static struct fauxdev_session *remove_closed_range_locked(unsigned int first, unsigned int last) {
@@ -688,6 +711,31 @@ static bool is_fake_fd(int fd) {
     return fake;
 }
 
+static ssize_t raw_pread64(int fd, void *buffer, size_t count, off64_t offset) {
+#if defined(__arm__)
+    /* ARM EABI aligns the 64-bit offset to an even register pair. */
+    return syscall(SYS_pread64, fd, buffer, count, 0,
+                   (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32));
+#elif defined(__i386__)
+    return syscall(SYS_pread64, fd, buffer, count,
+                   (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32));
+#else
+    return syscall(SYS_pread64, fd, buffer, count, offset);
+#endif
+}
+
+static ssize_t raw_pwrite64(int fd, const void *buffer, size_t count, off64_t offset) {
+#if defined(__arm__)
+    return syscall(SYS_pwrite64, fd, buffer, count, 0,
+                   (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32));
+#elif defined(__i386__)
+    return syscall(SYS_pwrite64, fd, buffer, count,
+                   (uint32_t)offset, (uint32_t)((uint64_t)offset >> 32));
+#else
+    return syscall(SYS_pwrite64, fd, buffer, count, offset);
+#endif
+}
+
 ssize_t read(int fd, void *buffer, size_t count) {
     if (is_fake_fd(fd)) {
         errno = EINVAL;
@@ -725,7 +773,7 @@ ssize_t pread(int fd, void *buffer, size_t count, off_t offset) {
         errno = EINVAL;
         return -1;
     }
-    return syscall(SYS_pread64, fd, buffer, count, offset);
+    return raw_pread64(fd, buffer, count, offset);
 }
 
 ssize_t fauxdev_pread64(int fd, void *buffer, size_t count, off64_t offset) __asm__("pread64");
@@ -734,7 +782,7 @@ ssize_t fauxdev_pread64(int fd, void *buffer, size_t count, off64_t offset) {
         errno = EINVAL;
         return -1;
     }
-    return syscall(SYS_pread64, fd, buffer, count, offset);
+    return raw_pread64(fd, buffer, count, offset);
 }
 
 ssize_t pwrite(int fd, const void *buffer, size_t count, off_t offset) {
@@ -742,7 +790,7 @@ ssize_t pwrite(int fd, const void *buffer, size_t count, off_t offset) {
         errno = EINVAL;
         return -1;
     }
-    return syscall(SYS_pwrite64, fd, buffer, count, offset);
+    return raw_pwrite64(fd, buffer, count, offset);
 }
 
 ssize_t fauxdev_pwrite64(int fd, const void *buffer, size_t count, off64_t offset)
@@ -752,7 +800,7 @@ ssize_t fauxdev_pwrite64(int fd, const void *buffer, size_t count, off64_t offse
         errno = EINVAL;
         return -1;
     }
-    return syscall(SYS_pwrite64, fd, buffer, count, offset);
+    return raw_pwrite64(fd, buffer, count, offset);
 }
 
 static void atfork_prepare(void) { pthread_mutex_lock(&registry_lock); }

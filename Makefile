@@ -18,10 +18,11 @@ LEGACY_BROKER_TEST := $(BUILD)/legacy-broker-client
 MULTIOPEN_TEST := $(BUILD)/video-multiopen-client
 CAMERA_MODES_TEST := $(BUILD)/camera-modes-broker-test
 CAMERA_GLOBAL_TEST := $(BUILD)/camera-global-broker-test
+ABI_TEST := $(BUILD)/abi-passthrough-client
 
 .PHONY: all test clean
 
-all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST) $(INVENTORY_TOOL) $(INVENTORY_TEST) $(CAMERA_SELECT_TEST) $(CAMERA_SELECT_BROKER_TEST) $(LEGACY_BROKER_TEST) $(MULTIOPEN_TEST) $(CAMERA_MODES_TEST) $(CAMERA_GLOBAL_TEST)
+all: $(LIB) $(TEST) $(TRANSPORT_TEST) $(VIDEO_TEST) $(VIDEO_BROKER_TEST) $(INVENTORY_TOOL) $(INVENTORY_TEST) $(CAMERA_SELECT_TEST) $(CAMERA_SELECT_BROKER_TEST) $(LEGACY_BROKER_TEST) $(MULTIOPEN_TEST) $(CAMERA_MODES_TEST) $(CAMERA_GLOBAL_TEST) $(ABI_TEST)
 
 $(BUILD):
 	mkdir -p $@
@@ -65,6 +66,9 @@ $(CAMERA_MODES_TEST): tests/camera_modes_broker_test.c src/transport.c src/trans
 $(CAMERA_GLOBAL_TEST): tests/camera_global_broker_test.c src/transport.c src/transport.h include/fauxdev/protocol.h | $(BUILD)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) tests/camera_global_broker_test.c src/transport.c -o $@ $(LDFLAGS)
 
+$(ABI_TEST): tests/abi_passthrough_client.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) tests/abi_passthrough_client.c -o $@ $(LDFLAGS)
+
 test: all
 	LD_PRELOAD=$(abspath $(LIB)) $(TEST)
 	$(TRANSPORT_TEST)
@@ -75,6 +79,7 @@ test: all
 	LD_PRELOAD=$(abspath $(LIB)) $(MULTIOPEN_TEST)
 	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_MODES_TEST)
 	LD_PRELOAD=$(abspath $(LIB)) $(CAMERA_GLOBAL_TEST)
+	LD_PRELOAD=$(abspath $(LIB)) $(ABI_TEST)
 
 clean:
 	rm -rf $(BUILD)

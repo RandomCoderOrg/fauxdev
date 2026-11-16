@@ -476,7 +476,7 @@ static int video_open(int readiness_fd, int flags, void **data) {
         }
         pthread_mutex_lock(&device_lock);
         device_locked = 1;
-        if (syscall(SYS_fstat, (int)fd, &broker_stat) < 0) goto fail;
+        if (fstat((int)fd, &broker_stat) < 0) goto fail;
         if (device_broker &&
             (device_broker_dev != broker_stat.st_dev || device_broker_ino != broker_stat.st_ino)) {
             if (device_broker_users) { errno = EBUSY; goto fail; }
@@ -1433,7 +1433,7 @@ static void *video_mmap(void *data, void *addr, size_t length, int prot, int fla
         errno = EINVAL;
         return MAP_FAILED;
     }
-    void *result = (void *)syscall(SYS_mmap, addr, length, prot, flags, s->memfd, offset);
+    void *result = fauxdev_raw_mmap(addr, length, prot, flags, s->memfd, offset);
     pthread_mutex_unlock(&s->lock);
     return result;
 }
