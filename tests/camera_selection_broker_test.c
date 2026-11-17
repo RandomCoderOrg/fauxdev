@@ -199,8 +199,8 @@ int main(void) {
     assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1 && errno == EINVAL);
     size.index = 0;
     size.pixel_format = V4L2_PIX_FMT_NV12;
-    errno = 0;
-    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1 && errno == EINVAL);
+    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0);
+    assert(size.discrete.width == 320 && size.discrete.height == 240);
     selected = 3;
     errno = 0;
     assert(ioctl(fd, VIDIOC_S_INPUT, &selected) == -1 && errno == EINVAL);
