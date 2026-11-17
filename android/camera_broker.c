@@ -53,6 +53,7 @@ struct camera {
     uint8_t *transfer_frame;
     uint32_t output_width;
     uint32_t output_height;
+    uint32_t pixel_format;
     size_t output_size;
     uint64_t frame_count;
     uint64_t last_served_frame;
@@ -561,8 +562,11 @@ static int convert_image(AImage *image, const struct camera *camera, uint8_t *ou
         planes[i].data = data;
         planes[i].length = (size_t)length;
     }
-    return fauxdev_yuv420_to_rgb24(output, (int)camera->output_width,
-                                  (int)camera->output_height, width, height, planes);
+    return camera->pixel_format == V4L2_PIX_FMT_NV12 ?
+        fauxdev_yuv420_to_nv12(output, (int)camera->output_width,
+                               (int)camera->output_height, width, height, planes) :
+        fauxdev_yuv420_to_rgb24(output, (int)camera->output_width,
+                                (int)camera->output_height, width, height, planes);
 }
 
 static void *drain_frames(void *context) {
@@ -602,10 +606,13 @@ static void *drain_frames(void *context) {
 
 static int open_camera(struct camera *camera, const struct fauxdev_camera_input *input,
                        uint32_t output_width, uint32_t output_height,
-                       uint32_t source_width, uint32_t source_height, uint32_t fps) {
+                       uint32_t source_width, uint32_t source_height, uint32_t fps,
+                       uint32_t pixel_format) {
     camera->output_width = output_width;
     camera->output_height = output_height;
-    camera->output_size = (size_t)output_width * output_height * 3;
+    camera->pixel_format = pixel_format;
+    camera->output_size = (size_t)output_width * output_height *
+                          (pixel_format == V4L2_PIX_FMT_NV12 ? 3 : 6) / 2;
     atomic_init(&camera->failed, false);
     atomic_init(&camera->reader_stop, false);
     if (pthread_mutex_init(&camera->frame_lock, NULL) != 0) return -ENOMEM;
@@ -618,8 +625,9 @@ static int open_camera(struct camera *camera, const struct fauxdev_camera_input 
     const char *id = input->id;
     const int width = (int)source_width;
     const int height = (int)source_height;
-    fprintf(stderr, "fauxdev camera %s: %dx%d YUV -> %dx%d RGB24\n",
-            id, width, height, output_width, output_height);
+    fprintf(stderr, "fauxdev camera %s: %dx%d YUV -> %dx%d %s\n",
+            id, width, height, output_width, output_height,
+            pixel_format == V4L2_PIX_FMT_NV12 ? "NV12" : "RGB24");
     if (AImageReader_new(width, height, AIMAGE_FORMAT_YUV_420_888, 2, &camera->reader) != AMEDIA_OK) {
         return -EIO;
     }
@@ -706,15 +714,16 @@ static int capture_frame(struct camera *camera, int client, uint8_t *output) {
 }
 
 static int validate_frame_request(const struct fauxdev_message *message,
-                                  uint32_t width, uint32_t height, size_t size,
+                                  uint32_t width, uint32_t height, uint32_t pixel_format, size_t size,
                                   struct fauxdev_video_frame_request *frame) {
     if (message->payload_size != sizeof(struct fauxdev_video_frame_request) || message->fd_count != 1)
         return -EINVAL;
     memcpy(frame, message->payload, sizeof(*frame));
     const uint32_t offset = le32toh(frame->offset);
     if (le32toh(frame->width) != width || le32toh(frame->height) != height ||
-        le32toh(frame->stride) != width * 3 ||
-        le32toh(frame->pixel_format) != V4L2_PIX_FMT_RGB24 || le32toh(frame->size) != size)
+        le32toh(frame->stride) != width * (pixel_format == V4L2_PIX_FMT_NV12 ? 1 : 3) ||
+        le32toh(frame->pixel_format) != pixel_format ||
+        le32toh(frame->size) != size)
         return -EINVAL;
     struct stat statbuf;
     if (fstat(message->fds[0], &statbuf) < 0) return -errno;
@@ -726,7 +735,8 @@ static int validate_frame_request(const struct fauxdev_message *message,
 static int capture_to_fd(struct camera *camera, int client, const struct fauxdev_message *message) {
     struct fauxdev_video_frame_request frame;
     int validation = validate_frame_request(message, camera->output_width,
-                                            camera->output_height, camera->output_size, &frame);
+                                            camera->output_height, camera->pixel_format,
+                                            camera->output_size, &frame);
     if (validation < 0) return validation;
     const uint32_t offset = le32toh(frame.offset);
     uint8_t *pixels = camera->transfer_frame;
@@ -1014,7 +1024,11 @@ static int serve_priority(const struct fauxdev_message *request,
 }
 
 static int start_camera(struct client_camera_state *state, uint32_t index,
-                        uint32_t width, uint32_t height, bool v2) {
+                        uint32_t width, uint32_t height, bool v2, uint32_t pixel_format) {
+    if (pixel_format != V4L2_PIX_FMT_RGB24 && pixel_format != V4L2_PIX_FMT_NV12)
+        return -EINVAL;
+    if (pixel_format == V4L2_PIX_FMT_NV12 && ((width & 1) || (height & 1)))
+        return -EINVAL;
     if (state->active) return -EBUSY;
     int result = load_inputs(state);
     if (result < 0) return result;
@@ -1074,7 +1088,8 @@ static int start_camera(struct client_camera_state *state, uint32_t index,
     if (result < 0) goto fail_start;
     struct camera *camera = calloc(1, sizeof(*camera));
     if (!camera) { result = -ENOMEM; release_camera(state); goto fail_start; }
-    result = open_camera(camera, input, width, height, source_width, source_height, target_fps);
+    result = open_camera(camera, input, width, height, source_width, source_height,
+                         target_fps, pixel_format);
     if (result >= 0 && stop_requested()) result = -ECANCELED;
     if (result < 0) {
         close_camera(camera);
@@ -1100,7 +1115,8 @@ static int serve_start(const struct fauxdev_message *request, struct client_came
         return -EINVAL;
     struct fauxdev_camera_start_request start;
     memcpy(&start, request->payload, sizeof(start));
-    return start_camera(state, le32toh(start.index), OUTPUT_WIDTH, OUTPUT_HEIGHT, false);
+    return start_camera(state, le32toh(start.index), OUTPUT_WIDTH, OUTPUT_HEIGHT,
+                        false, V4L2_PIX_FMT_RGB24);
 }
 
 static int serve_start_v2(const struct fauxdev_message *request, struct client_camera_state *state) {
@@ -1109,7 +1125,16 @@ static int serve_start_v2(const struct fauxdev_message *request, struct client_c
     struct fauxdev_camera_start_v2_request start;
     memcpy(&start, request->payload, sizeof(start));
     return start_camera(state, le32toh(start.index), le32toh(start.width),
-                        le32toh(start.height), true);
+                        le32toh(start.height), true, V4L2_PIX_FMT_RGB24);
+}
+
+static int serve_start_v3(const struct fauxdev_message *request, struct client_camera_state *state) {
+    if (request->payload_size != sizeof(struct fauxdev_camera_start_v3_request) || request->fd_count)
+        return -EINVAL;
+    struct fauxdev_camera_start_v3_request start;
+    memcpy(&start, request->payload, sizeof(start));
+    return start_camera(state, le32toh(start.index), le32toh(start.width),
+                        le32toh(start.height), true, le32toh(start.pixel_format));
 }
 
 static int serve_legacy_frame(int client, const struct fauxdev_message *request,
@@ -1117,13 +1142,14 @@ static int serve_legacy_frame(int client, const struct fauxdev_message *request,
     if (!state->active) {
         if (state->explicit_lifecycle) return -EPIPE;
         struct fauxdev_video_frame_request frame;
-        int result = validate_frame_request(request, OUTPUT_WIDTH, OUTPUT_HEIGHT, OUTPUT_SIZE, &frame);
+        int result = validate_frame_request(request, OUTPUT_WIDTH, OUTPUT_HEIGHT,
+                                            V4L2_PIX_FMT_RGB24, OUTPUT_SIZE, &frame);
         if (result < 0) return result;
         result = load_inputs(state);
         if (result < 0) return result;
         if (!le32toh(state->inputs->count)) return -ENODEV;
         result = start_camera(state, le32toh(state->inputs->default_index),
-                              OUTPUT_WIDTH, OUTPUT_HEIGHT, false);
+                              OUTPUT_WIDTH, OUTPUT_HEIGHT, false, V4L2_PIX_FMT_RGB24);
         if (result < 0) return result;
     }
     return capture_to_fd(state->active, client, request);
@@ -1244,6 +1270,10 @@ static int serve_client(int client, struct client_camera_state *state, struct in
         case FAUXDEV_OPCODE_CAMERA_START_V2:
             state->explicit_lifecycle = true;
             status = serve_start_v2(&request, state);
+            break;
+        case FAUXDEV_OPCODE_CAMERA_START_V3:
+            state->explicit_lifecycle = true;
+            status = serve_start_v3(&request, state);
             break;
         case FAUXDEV_OPCODE_CAMERA_STOP:
             state->explicit_lifecycle = true;

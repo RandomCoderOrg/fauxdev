@@ -4,7 +4,7 @@
 process, which already runs Binder transactions. It opens a selected
 `YUV_420_888` preview stream (preferring the rear camera and 640×480 for the
 legacy default), drains its image queue continuously, converts the latest
-image to RGB24, and replies only after writing it. It does not need a kernel
+image to the requested RGB24 or NV12 format, and replies only after writing it. NV12 packs the YUV planes without RGB conversion. It does not need a kernel
 `/dev/video0`; the guest-facing path remains the Linux preload library.
 
 Build on macOS with an installed Android NDK:
@@ -41,13 +41,13 @@ from paged `CAMERA_MODES` requests (wire-v1 opcode 7); `CAMERA_START_V2`
 (opcode 8) validates the selected input and dimensions before opening a
 same-size image reader. A converted 320×240 mode remains available if the
 camera does not advertise it natively. Older brokers return `ENOTTY` and the
-guest keeps only 320×240 using the original `CAMERA_START` request. Android's
+guest keeps only 320×240 using the original `CAMERA_START` request. NV12 needs even dimensions and uses `CAMERA_START_V3` (opcode 18); an older broker rejects that request at `STREAMON`. Android's
 separate maximum-resolution pixel-mode configurations are not enumerated.
 The broker snapshots the camera catalog when its service starts, so input
 indexes stay stable for all connected processes; a camera that disappears
 afterward fails at start rather than being reindexed.
 
-Current brokers own the selected input, RGB24 size, and a generation number
+Current brokers own the selected input, capture size, and a generation number
 globally. `G_INPUT`/`G_FMT` fetch that state; `S_INPUT`/`S_FMT` update it only
 while no process owns the buffer queue. The first nonzero `REQBUFS` or
 `CREATE_BUFS` acquires the queue lease, which survives `STREAMOFF` and ends on

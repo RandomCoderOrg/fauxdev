@@ -22,7 +22,7 @@ requests, file descriptors in both directions, sealed `memfd` mappings,
 backend error replies, and disconnect notification through a test `eventfd`.
 The probe device is not yet wired to this transport.
 
-`/dev/video0` is a separate V4L2 RGB24 capture source with MMAP buffers
+`/dev/video0` is a separate V4L2 RGB24 or NV12 capture source with MMAP buffers
 (up to 64 slots within a 128 MiB aggregate budget). Without a broker it
 produces deterministic 320×240 test frames. Setting `FAUXDEV_VIDEO_SOCKET` connects it to a broker
 that writes into per-request staging FDs. An

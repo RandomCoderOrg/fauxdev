@@ -15,5 +15,9 @@ int fauxdev_yuv420_to_rgb24(
     uint8_t *output, int output_width, int output_height,
     int input_width, int input_height, const struct fauxdev_plane planes[3]
 );
+int fauxdev_yuv420_to_nv12(
+    uint8_t *output, int output_width, int output_height,
+    int input_width, int input_height, const struct fauxdev_plane planes[3]
+);
 
 #endif

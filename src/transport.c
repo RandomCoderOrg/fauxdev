@@ -247,6 +247,7 @@ int fauxdev_transport_request(
                           opcode == FAUXDEV_OPCODE_CAMERA_STOP ? 20000 :
                           opcode == FAUXDEV_OPCODE_CAMERA_START ||
                           opcode == FAUXDEV_OPCODE_CAMERA_START_V2 ||
+                          opcode == FAUXDEV_OPCODE_CAMERA_START_V3 ||
                           opcode == FAUXDEV_OPCODE_CAMERA_SET_CONFIG ||
                           opcode == FAUXDEV_OPCODE_CAMERA_ENUM_RATES ||
                           opcode == FAUXDEV_OPCODE_CAMERA_SET_RATE ? 10000 :

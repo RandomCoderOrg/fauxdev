@@ -35,6 +35,7 @@ static void *broker(void *context) {
     const struct broker_args *args = context;
     int active = -1;
     unsigned int width = 0, height = 0;
+    uint32_t pixel_format = V4L2_PIX_FMT_RGB24;
     struct fauxdev_message request;
     while (fauxdev_message_receive(args->fd, &request) == 0) {
         switch (request.opcode) {
@@ -97,6 +98,19 @@ static void *broker(void *context) {
             reply(args->fd, &request, 0, NULL, 0);
             break;
         }
+        case FAUXDEV_OPCODE_CAMERA_START_V3: {
+            struct fauxdev_camera_start_v3_request start;
+            assert(request.payload_size == sizeof(start) && !request.fd_count && active < 0);
+            memcpy(&start, request.payload, sizeof(start));
+            active = (int)le32toh(start.index);
+            width = le32toh(start.width);
+            height = le32toh(start.height);
+            pixel_format = le32toh(start.pixel_format);
+            assert(active == 1 && width == 800 && height == 600 &&
+                   pixel_format == V4L2_PIX_FMT_NV12);
+            reply(args->fd, &request, 0, NULL, 0);
+            break;
+        }
         case FAUXDEV_OPCODE_CAMERA_START: {
             struct fauxdev_camera_start_request start;
             assert(args->no_start_v2 && request.payload_size == sizeof(start) && !request.fd_count);
@@ -111,9 +125,10 @@ static void *broker(void *context) {
             struct fauxdev_video_frame_request frame;
             assert(active >= 0 && request.payload_size == sizeof(frame) && request.fd_count == 1);
             memcpy(&frame, request.payload, sizeof(frame));
-            size_t size = (size_t)width * height * 3;
+            size_t size = (size_t)width * height * (pixel_format == V4L2_PIX_FMT_NV12 ? 3 : 6) / 2;
             assert(le32toh(frame.width) == width && le32toh(frame.height) == height &&
-                   le32toh(frame.size) == size);
+                   le32toh(frame.size) == size && le32toh(frame.pixel_format) == pixel_format &&
+                   le32toh(frame.stride) == width * (pixel_format == V4L2_PIX_FMT_NV12 ? 1 : 3));
             struct stat st;
             assert(fstat(request.fds[0], &st) == 0 && st.st_size >= (off_t)size);
             unsigned char pixel = active ? 0x33 : 0x55;
@@ -125,6 +140,7 @@ static void *broker(void *context) {
         case FAUXDEV_OPCODE_CAMERA_STOP:
             assert(active >= 0);
             active = -1;
+            pixel_format = V4L2_PIX_FMT_RGB24;
             reply(args->fd, &request, 0, NULL, 0);
             break;
         default:
@@ -181,6 +197,9 @@ int main(void) {
     struct v4l2_frmsizeenum size = {.pixel_format = V4L2_PIX_FMT_RGB24, .index = 64};
     assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0 &&
            size.discrete.width == LARGE_W && size.discrete.height == LARGE_H);
+    struct v4l2_frmsizeenum nv_size = {.pixel_format = V4L2_PIX_FMT_NV12, .index = 1};
+    assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &nv_size) == 0 &&
+           nv_size.discrete.width == 102 && nv_size.discrete.height == 100);
     size.index = 65;
     errno = 0;
     assert(ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == -1 && errno == EINVAL);
@@ -224,6 +243,21 @@ int main(void) {
     assert(ioctl(fd, VIDIOC_STREAMON, &type) == 0);
     frame = (struct v4l2_buffer){.type = type, .memory = V4L2_MEMORY_MMAP};
     assert(ioctl(fd, VIDIOC_DQBUF, &frame) == 0 && frame.bytesused == 800 * 600 * 3);
+    assert(ioctl(fd, VIDIOC_STREAMOFF, &type) == 0);
+    req.count = 0;
+    assert(ioctl(fd, VIDIOC_REQBUFS, &req) == 0);
+    format.fmt.pix.width = 800;
+    format.fmt.pix.height = 600;
+    format.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+    assert(ioctl(fd, VIDIOC_S_FMT, &format) == 0);
+    assert(format.fmt.pix.sizeimage == 800 * 600 * 3 / 2);
+    req.count = 2;
+    assert(ioctl(fd, VIDIOC_REQBUFS, &req) == 0);
+    frame = (struct v4l2_buffer){.type = req.type, .memory = req.memory, .index = 0};
+    assert(ioctl(fd, VIDIOC_QBUF, &frame) == 0);
+    assert(ioctl(fd, VIDIOC_STREAMON, &type) == 0);
+    frame = (struct v4l2_buffer){.type = type, .memory = V4L2_MEMORY_MMAP};
+    assert(ioctl(fd, VIDIOC_DQBUF, &frame) == 0 && frame.bytesused == 800 * 600 * 3 / 2);
     assert(ioctl(fd, VIDIOC_STREAMOFF, &type) == 0);
     assert(pixels[0] == 0x55 && pixels[LARGE_SIZE - 1] == 0x55);
     assert(munmap(pixels, LARGE_SIZE) == 0);

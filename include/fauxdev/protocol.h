@@ -31,6 +31,7 @@ enum fauxdev_opcode {
     FAUXDEV_OPCODE_CAMERA_ENUM_RATES = 15u,
     FAUXDEV_OPCODE_CAMERA_GET_RATE = 16u,
     FAUXDEV_OPCODE_CAMERA_SET_RATE = 17u,
+    FAUXDEV_OPCODE_CAMERA_START_V3 = 18u,
 };
 
 #define FAUXDEV_CAMERA_MAX_INPUTS 64u
@@ -73,6 +74,12 @@ struct fauxdev_camera_start_v2_request {
     uint32_t index;
     uint32_t width;
     uint32_t height;
+};
+struct fauxdev_camera_start_v3_request {
+    uint32_t index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;
 };
 
 struct fauxdev_camera_config {
@@ -135,6 +142,7 @@ static_assert(sizeof(struct fauxdev_camera_input) == 268, "unexpected camera inp
 static_assert(sizeof(struct fauxdev_camera_start_request) == 4, "unexpected camera start layout");
 static_assert(sizeof(struct fauxdev_camera_mode) == 8, "unexpected camera mode layout");
 static_assert(sizeof(struct fauxdev_camera_start_v2_request) == 12, "unexpected camera start v2 layout");
+static_assert(sizeof(struct fauxdev_camera_start_v3_request) == 16, "unexpected camera start v3 layout");
 static_assert(sizeof(struct fauxdev_camera_config) == 24, "unexpected camera config layout");
 static_assert(sizeof(struct fauxdev_camera_queue_request) == 8, "unexpected queue layout");
 static_assert(sizeof(struct fauxdev_camera_rates_request) == 16, "unexpected rate request layout");
@@ -147,6 +155,7 @@ _Static_assert(sizeof(struct fauxdev_camera_input) == 268, "unexpected camera in
 _Static_assert(sizeof(struct fauxdev_camera_start_request) == 4, "unexpected camera start layout");
 _Static_assert(sizeof(struct fauxdev_camera_mode) == 8, "unexpected camera mode layout");
 _Static_assert(sizeof(struct fauxdev_camera_start_v2_request) == 12, "unexpected camera start v2 layout");
+_Static_assert(sizeof(struct fauxdev_camera_start_v3_request) == 16, "unexpected camera start v3 layout");
 _Static_assert(sizeof(struct fauxdev_camera_config) == 24, "unexpected camera config layout");
 _Static_assert(sizeof(struct fauxdev_camera_queue_request) == 8, "unexpected queue layout");
 _Static_assert(sizeof(struct fauxdev_camera_rates_request) == 16, "unexpected rate request layout");

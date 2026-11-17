@@ -39,6 +39,7 @@ struct video_session {
     size_t slot_size;
     size_t backing_size;
     uint32_t width, height;
+    uint32_t pixel_format;
     size_t frame_size;
     struct fauxdev_camera_mode *modes;
     unsigned int mode_count;
@@ -114,6 +115,15 @@ static void drain(struct video_session *s) {
 static int valid_dimensions(uint32_t width, uint32_t height) {
     return width && height && (uint64_t)width * height * 3 <= MAX_FRAME_SIZE &&
            (uint64_t)width * 3 <= UINT32_MAX;
+}
+
+static int valid_format(uint32_t format, uint32_t width, uint32_t height) {
+    return format == V4L2_PIX_FMT_RGB24 ||
+           (format == V4L2_PIX_FMT_NV12 && !(width & 1) && !(height & 1));
+}
+
+static size_t image_size(uint32_t format, uint32_t width, uint32_t height) {
+    return (size_t)width * height * (format == V4L2_PIX_FMT_NV12 ? 3 : 6) / 2;
 }
 
 static int load_modes(struct fauxdev_transport *broker, unsigned int input,
@@ -337,7 +347,9 @@ static int sync_config(struct video_session *s) {
     for (unsigned int i = 0; i < count; ++i)
         if (available[i].width == current.width && available[i].height == current.height) found = 1;
     if (!found) { free(modes); errno = EPROTO; return -1; }
-    size_t frame_size = (size_t)current.width * current.height * 3;
+    uint32_t format = valid_format(s->pixel_format, current.width, current.height) ?
+                      s->pixel_format : V4L2_PIX_FMT_RGB24;
+    size_t frame_size = image_size(format, current.width, current.height);
     unsigned char *pixels = malloc(frame_size);
     if (!pixels) { free(modes); return -1; }
     if (modes) {
@@ -351,6 +363,7 @@ static int sync_config(struct video_session *s) {
     s->selected_input = current.index;
     s->width = current.width;
     s->height = current.height;
+    s->pixel_format = format;
     s->frame_size = frame_size;
     s->slot_size = (frame_size + s->page_size - 1) / s->page_size * s->page_size;
     s->config_generation = current.generation;
@@ -442,6 +455,7 @@ static int video_open(int readiness_fd, int flags, void **data) {
     s->page_size = (size_t)page_size;
     s->width = WIDTH;
     s->height = HEIGHT;
+    s->pixel_format = V4L2_PIX_FMT_RGB24;
     s->frame_size = FRAME_SIZE;
     if (s->slot_size > MAX_BACKING_SIZE / 2) {
         syscall(SYS_close, s->readiness_fd);
@@ -588,15 +602,15 @@ fail: {
     }
 }
 
-static void fill_format(struct v4l2_format *f, uint32_t width, uint32_t height) {
+static void fill_format(struct v4l2_format *f, uint32_t width, uint32_t height, uint32_t format) {
     memset(&f->fmt, 0, sizeof(f->fmt));
     f->fmt.pix.width = width;
     f->fmt.pix.height = height;
-    f->fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
+    f->fmt.pix.pixelformat = format;
     f->fmt.pix.field = V4L2_FIELD_NONE;
-    f->fmt.pix.bytesperline = width * 3;
-    f->fmt.pix.sizeimage = width * height * 3;
-    f->fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+    f->fmt.pix.bytesperline = width * (format == V4L2_PIX_FMT_NV12 ? 1 : 3);
+    f->fmt.pix.sizeimage = image_size(format, width, height);
+    f->fmt.pix.colorspace = format == V4L2_PIX_FMT_NV12 ? V4L2_COLORSPACE_DEFAULT : V4L2_COLORSPACE_SRGB;
     f->fmt.pix.priv = V4L2_PIX_FMT_PRIV_MAGIC;
 }
 
@@ -608,11 +622,13 @@ static void fill_capture_parm(struct v4l2_streamparm *parm, uint32_t fps) {
 }
 
 static struct fauxdev_camera_mode nearest_mode(const struct video_session *s,
-                                                 uint32_t width, uint32_t height) {
+                                                 uint32_t width, uint32_t height,
+                                                 uint32_t format) {
     struct fauxdev_camera_mode best = s->modes[0];
     uint64_t best_distance = UINT64_MAX, best_area = UINT64_MAX;
     for (unsigned int i = 0; i < s->mode_count; ++i) {
         const struct fauxdev_camera_mode mode = s->modes[i];
+        if (!valid_format(format, mode.width, mode.height)) continue;
         uint64_t dx = mode.width > width ? mode.width - (uint64_t)width : width - (uint64_t)mode.width;
         uint64_t dy = mode.height > height ? mode.height - (uint64_t)height : height - (uint64_t)mode.height;
         uint64_t distance = dx + dy, area = (uint64_t)mode.width * mode.height;
@@ -655,8 +671,8 @@ static int capture_slot(struct video_session *s, unsigned int sequence, unsigned
             .offset = htole32(0),
             .width = htole32(s->width),
             .height = htole32(s->height),
-            .stride = htole32(s->width * 3),
-            .pixel_format = htole32(V4L2_PIX_FMT_RGB24),
+            .stride = htole32(s->width * (s->pixel_format == V4L2_PIX_FMT_NV12 ? 1 : 3)),
+            .pixel_format = htole32(s->pixel_format),
             .size = htole32((uint32_t)s->frame_size),
         };
         struct fauxdev_message response;
@@ -685,7 +701,12 @@ static int capture_slot(struct video_session *s, unsigned int sequence, unsigned
         }
         syscall(SYS_close, staging);
     } else {
-        for (unsigned int y = 0; y < s->height; y++) {
+        if (s->pixel_format == V4L2_PIX_FMT_NV12) {
+            memset(pixels, 0x80, s->frame_size);
+            for (unsigned int y = 0; y < s->height; ++y)
+                for (unsigned int x = 0; x < s->width; ++x)
+                    pixels[(size_t)y * s->width + x] = (unsigned char)(x + y + sequence);
+        } else for (unsigned int y = 0; y < s->height; y++) {
             for (unsigned int x = 0; x < s->width; x++) {
                 const size_t at = ((size_t)y * s->width + x) * 3;
                 pixels[at] = (unsigned char)(x * 4);
@@ -942,7 +963,8 @@ static int video_ioctl(
                        &modes, &mode_count, &mode_query_supported) < 0) {
             result = -1; break;
         }
-        unsigned char *pixels = malloc(FRAME_SIZE);
+        size_t frame_size = image_size(s->pixel_format, WIDTH, HEIGHT);
+        unsigned char *pixels = malloc(frame_size);
         if (!pixels) { free(modes); result = -1; break; }
         uint64_t generation = s->config_generation;
         if (s->config_supported && set_config(s, (uint32_t)index, WIDTH, HEIGHT, &generation) < 0) {
@@ -962,8 +984,8 @@ static int video_ioctl(
         s->pixels = pixels;
         s->width = WIDTH;
         s->height = HEIGHT;
-        s->frame_size = FRAME_SIZE;
-        s->slot_size = (FRAME_SIZE + s->page_size - 1) / s->page_size * s->page_size;
+        s->frame_size = frame_size;
+        s->slot_size = (frame_size + s->page_size - 1) / s->page_size * s->page_size;
         s->selected_input = (unsigned)index;
         s->config_generation = generation;
         break;
@@ -983,23 +1005,30 @@ static int video_ioctl(
     }
     case VIDIOC_ENUM_FMT: {
         struct v4l2_fmtdesc *desc = argument;
-        if (desc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || desc->index) { errno = EINVAL; result = -1; break; }
+        if (desc->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || desc->index > 1) { errno = EINVAL; result = -1; break; }
         memset(desc->reserved, 0, sizeof(desc->reserved));
         desc->flags = 0;
-        desc->pixelformat = V4L2_PIX_FMT_RGB24;
+        desc->pixelformat = desc->index ? V4L2_PIX_FMT_NV12 : V4L2_PIX_FMT_RGB24;
         memset(desc->description, 0, sizeof(desc->description));
-        memcpy(desc->description, "24-bit RGB 8-8-8", 17);
+        memcpy(desc->description, desc->index ? "NV12 YUV 4:2:0" : "24-bit RGB 8-8-8",
+               desc->index ? 15 : 17);
         break;
     }
     case VIDIOC_ENUM_FRAMESIZES: {
         struct v4l2_frmsizeenum *size = argument;
         if (sync_config(s) < 0) { result = -1; break; }
-        if (size->index >= s->mode_count || size->pixel_format != V4L2_PIX_FMT_RGB24) {
-            errno = EINVAL; result = -1; break;
+        if (size->pixel_format != V4L2_PIX_FMT_RGB24 &&
+            size->pixel_format != V4L2_PIX_FMT_NV12) { errno = EINVAL; result = -1; break; }
+        unsigned int mode = 0, matching = 0;
+        for (; mode < s->mode_count; ++mode) {
+            if (!valid_format(size->pixel_format, s->modes[mode].width,
+                              s->modes[mode].height)) continue;
+            if (matching++ == size->index) break;
         }
+        if (mode == s->mode_count) { errno = EINVAL; result = -1; break; }
         size->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-        size->discrete.width = s->modes[size->index].width;
-        size->discrete.height = s->modes[size->index].height;
+        size->discrete.width = s->modes[mode].width;
+        size->discrete.height = s->modes[mode].height;
         memset(size->reserved, 0, sizeof(size->reserved));
         break;
     }
@@ -1010,7 +1039,7 @@ static int video_ioctl(
         for (unsigned int i = 0; i < s->mode_count; ++i)
             if (s->modes[i].width == interval->width &&
                 s->modes[i].height == interval->height) valid = 1;
-        if (!valid || interval->pixel_format != V4L2_PIX_FMT_RGB24) {
+        if (!valid || !valid_format(interval->pixel_format, interval->width, interval->height)) {
             errno = EINVAL; result = -1; break;
         }
         uint32_t rates[MAX_CAMERA_RATES];
@@ -1095,14 +1124,22 @@ static int video_ioctl(
         if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE ||
             (request == VIDIOC_S_FMT && s->count)) { errno = request == VIDIOC_S_FMT && s->count ? EBUSY : EINVAL; result = -1; break; }
         if (sync_config(s) < 0) { result = -1; break; }
-        if (request == VIDIOC_G_FMT) { fill_format(f, s->width, s->height); break; }
-        struct fauxdev_camera_mode chosen = nearest_mode(s, f->fmt.pix.width, f->fmt.pix.height);
+        if (request == VIDIOC_G_FMT) { fill_format(f, s->width, s->height, s->pixel_format); break; }
+        uint32_t format = f->fmt.pix.pixelformat == V4L2_PIX_FMT_NV12 ?
+                          V4L2_PIX_FMT_NV12 : V4L2_PIX_FMT_RGB24;
+        struct fauxdev_camera_mode chosen = nearest_mode(s, f->fmt.pix.width,
+                                                         f->fmt.pix.height, format);
         if (request == VIDIOC_S_FMT) {
             pthread_mutex_lock(&device_lock);
             const int lower_priority = s->priority < highest_priority_locked(s);
             pthread_mutex_unlock(&device_lock);
             if (lower_priority) { errno = EBUSY; result = -1; break; }
-            size_t frame_size = (size_t)chosen.width * chosen.height * 3;
+        }
+        if (!valid_format(format, chosen.width, chosen.height)) {
+            errno = EINVAL; result = -1; break;
+        }
+        if (request == VIDIOC_S_FMT) {
+            size_t frame_size = image_size(format, chosen.width, chosen.height);
             size_t slot_size = (frame_size + s->page_size - 1) / s->page_size * s->page_size;
             if (slot_size > MAX_BACKING_SIZE / 2) { errno = EOVERFLOW; result = -1; break; }
             unsigned char *pixels = malloc(frame_size);
@@ -1121,11 +1158,12 @@ static int video_ioctl(
             s->pixels = pixels;
             s->width = chosen.width;
             s->height = chosen.height;
+            s->pixel_format = format;
             s->frame_size = frame_size;
             s->slot_size = slot_size;
             s->config_generation = generation;
         }
-        fill_format(f, chosen.width, chosen.height);
+        fill_format(f, chosen.width, chosen.height, format);
         break;
     }
     case VIDIOC_REQBUFS: {
@@ -1219,7 +1257,7 @@ static int video_ioctl(
         if (!s->count && sync_config(s) < 0) { result = -1; break; }
         const struct v4l2_pix_format *format = &created->format.fmt.pix;
         if (format->width != s->width || format->height != s->height ||
-            format->pixelformat != V4L2_PIX_FMT_RGB24 || format->field != V4L2_FIELD_NONE ||
+            format->pixelformat != s->pixel_format || format->field != V4L2_FIELD_NONE ||
             format->sizeimage < s->frame_size || format->sizeimage > MAX_BACKING_SIZE) {
             errno = EINVAL; result = -1; break;
         }
@@ -1309,13 +1347,19 @@ static int video_ioctl(
                 errno = ENOTTY; result = -1; break;
             }
             struct fauxdev_message response;
+            struct fauxdev_camera_start_v3_request start_v3 = {
+                .index = htole32(s->selected_input), .width = htole32(s->width),
+                .height = htole32(s->height), .pixel_format = htole32(s->pixel_format),
+            };
             struct fauxdev_camera_start_v2_request start_v2 = {
                 .index = htole32(s->selected_input), .width = htole32(s->width),
                 .height = htole32(s->height),
             };
             struct fauxdev_camera_start_request start_v1 = {.index = htole32(s->selected_input)};
             int use_v2 = s->mode_query_supported && !s->start_v2_unsupported;
-            int started = use_v2 ?
+            int started = s->pixel_format == V4L2_PIX_FMT_NV12 ?
+                fauxdev_transport_request(s->broker, FAUXDEV_OPCODE_CAMERA_START_V3,
+                    &start_v3, sizeof(start_v3), NULL, 0, &response) : use_v2 ?
                 fauxdev_transport_request(s->broker, FAUXDEV_OPCODE_CAMERA_START_V2,
                     &start_v2, sizeof(start_v2), NULL, 0, &response) :
                 fauxdev_transport_request(s->broker, FAUXDEV_OPCODE_CAMERA_START,
